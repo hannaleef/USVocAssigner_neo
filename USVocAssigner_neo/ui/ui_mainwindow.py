@@ -15,12 +15,12 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QFormLayout, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLayout,
-    QLineEdit, QMainWindow, QMenuBar, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QSplitter, QStatusBar, QTabWidget, QTextEdit,
-    QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QFormLayout, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLayout, QLineEdit, QMainWindow, QMenuBar,
+    QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QSpinBox, QSplitter, QStatusBar, QTabWidget,
+    QTextEdit, QVBoxLayout, QWidget)
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
@@ -34,105 +34,197 @@ class Ui_MainWindow(object):
         MainWindow.setSizePolicy(sizePolicy)
         self.centralwidget = QWidget(MainWindow)
         self.centralwidget.setObjectName(u"centralwidget")
-        self.verticalLayout_6 = QVBoxLayout(self.centralwidget)
-        self.verticalLayout_6.setSpacing(6)
-        self.verticalLayout_6.setObjectName(u"verticalLayout_6")
-        self.verticalLayout_6.setContentsMargins(15, 15, 15, 15)
-        self.group_btn_file = QHBoxLayout()
-        self.group_btn_file.setObjectName(u"group_btn_file")
+        self.verticalLayout_15 = QVBoxLayout(self.centralwidget)
+        self.verticalLayout_15.setObjectName(u"verticalLayout_15")
+        self.horizontalLayout_16 = QHBoxLayout()
+        self.horizontalLayout_16.setObjectName(u"horizontalLayout_16")
         self.btn_save_process = QPushButton(self.centralwidget)
         self.btn_save_process.setObjectName(u"btn_save_process")
 
-        self.group_btn_file.addWidget(self.btn_save_process)
+        self.horizontalLayout_16.addWidget(self.btn_save_process)
 
         self.btn_open_file = QPushButton(self.centralwidget)
         self.btn_open_file.setObjectName(u"btn_open_file")
 
-        self.group_btn_file.addWidget(self.btn_open_file)
+        self.horizontalLayout_16.addWidget(self.btn_open_file)
 
         self.btn_save_csv = QPushButton(self.centralwidget)
         self.btn_save_csv.setObjectName(u"btn_save_csv")
 
-        self.group_btn_file.addWidget(self.btn_save_csv)
+        self.horizontalLayout_16.addWidget(self.btn_save_csv)
 
         self.btn_save_pdf = QPushButton(self.centralwidget)
         self.btn_save_pdf.setObjectName(u"btn_save_pdf")
 
-        self.group_btn_file.addWidget(self.btn_save_pdf)
+        self.horizontalLayout_16.addWidget(self.btn_save_pdf)
 
 
-        self.verticalLayout_6.addLayout(self.group_btn_file)
+        self.verticalLayout_15.addLayout(self.horizontalLayout_16)
 
-        self.file_panel = QGroupBox(self.centralwidget)
-        self.file_panel.setObjectName(u"file_panel")
-        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.widget = QWidget(self.centralwidget)
+        self.widget.setObjectName(u"widget")
+        self.verticalLayout_6 = QVBoxLayout(self.widget)
+        self.verticalLayout_6.setObjectName(u"verticalLayout_6")
+        self.splitter_2 = QSplitter(self.widget)
+        self.splitter_2.setObjectName(u"splitter_2")
+        self.splitter_2.setOrientation(Qt.Orientation.Vertical)
+        self.tab_file_panel = QTabWidget(self.splitter_2)
+        self.tab_file_panel.setObjectName(u"tab_file_panel")
+        self.widget1 = QWidget()
+        self.widget1.setObjectName(u"widget1")
+        self.horizontalLayout_13 = QHBoxLayout(self.widget1)
+        self.horizontalLayout_13.setObjectName(u"horizontalLayout_13")
+        self.scroll_audio_file = QScrollArea(self.widget1)
+        self.scroll_audio_file.setObjectName(u"scroll_audio_file")
+        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
-        sizePolicy1.setHeightForWidth(self.file_panel.sizePolicy().hasHeightForWidth())
-        self.file_panel.setSizePolicy(sizePolicy1)
-        self.gridLayout = QGridLayout(self.file_panel)
-        self.gridLayout.setSpacing(10)
-        self.gridLayout.setObjectName(u"gridLayout")
-        self.gridLayout.setContentsMargins(10, 10, 10, 10)
-        self.line_audio_path = QLineEdit(self.file_panel)
-        self.line_audio_path.setObjectName(u"line_audio_path")
-        sizePolicy1.setHeightForWidth(self.line_audio_path.sizePolicy().hasHeightForWidth())
-        self.line_audio_path.setSizePolicy(sizePolicy1)
-
-        self.gridLayout.addWidget(self.line_audio_path, 0, 2, 1, 1)
-
-        self.lbl_video_file = QLabel(self.file_panel)
-        self.lbl_video_file.setObjectName(u"lbl_video_file")
+        sizePolicy1.setHeightForWidth(self.scroll_audio_file.sizePolicy().hasHeightForWidth())
+        self.scroll_audio_file.setSizePolicy(sizePolicy1)
+        self.scroll_audio_file.setWidgetResizable(True)
+        self.scroll_audio_file.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scrollAreaWidgetContents_5 = QWidget()
+        self.scrollAreaWidgetContents_5.setObjectName(u"scrollAreaWidgetContents_5")
+        self.scrollAreaWidgetContents_5.setGeometry(QRect(0, 0, 924, 80))
+        self.verticalLayout_14 = QVBoxLayout(self.scrollAreaWidgetContents_5)
+        self.verticalLayout_14.setObjectName(u"verticalLayout_14")
+        self.horizontalLayout_15 = QHBoxLayout()
+        self.horizontalLayout_15.setObjectName(u"horizontalLayout_15")
+        self.lbl_subject_id = QLabel(self.scrollAreaWidgetContents_5)
+        self.lbl_subject_id.setObjectName(u"lbl_subject_id")
         sizePolicy2 = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         sizePolicy2.setHorizontalStretch(0)
         sizePolicy2.setVerticalStretch(0)
+        sizePolicy2.setHeightForWidth(self.lbl_subject_id.sizePolicy().hasHeightForWidth())
+        self.lbl_subject_id.setSizePolicy(sizePolicy2)
+
+        self.horizontalLayout_15.addWidget(self.lbl_subject_id)
+
+        self.line_subject_id = QLineEdit(self.scrollAreaWidgetContents_5)
+        self.line_subject_id.setObjectName(u"line_subject_id")
+        sizePolicy3 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        sizePolicy3.setHorizontalStretch(0)
+        sizePolicy3.setVerticalStretch(0)
+        sizePolicy3.setHeightForWidth(self.line_subject_id.sizePolicy().hasHeightForWidth())
+        self.line_subject_id.setSizePolicy(sizePolicy3)
+
+        self.horizontalLayout_15.addWidget(self.line_subject_id)
+
+        self.line = QFrame(self.scrollAreaWidgetContents_5)
+        self.line.setObjectName(u"line")
+        self.line.setFrameShape(QFrame.Shape.VLine)
+        self.line.setFrameShadow(QFrame.Shadow.Sunken)
+
+        self.horizontalLayout_15.addWidget(self.line)
+
+        self.lbl_audio_path = QLabel(self.scrollAreaWidgetContents_5)
+        self.lbl_audio_path.setObjectName(u"lbl_audio_path")
+
+        self.horizontalLayout_15.addWidget(self.lbl_audio_path)
+
+        self.line_audio_path = QLineEdit(self.scrollAreaWidgetContents_5)
+        self.line_audio_path.setObjectName(u"line_audio_path")
+        sizePolicy4 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sizePolicy4.setHorizontalStretch(0)
+        sizePolicy4.setVerticalStretch(0)
+        sizePolicy4.setHeightForWidth(self.line_audio_path.sizePolicy().hasHeightForWidth())
+        self.line_audio_path.setSizePolicy(sizePolicy4)
+
+        self.horizontalLayout_15.addWidget(self.line_audio_path)
+
+        self.btn_audio_browse = QPushButton(self.scrollAreaWidgetContents_5)
+        self.btn_audio_browse.setObjectName(u"btn_audio_browse")
+
+        self.horizontalLayout_15.addWidget(self.btn_audio_browse)
+
+
+        self.verticalLayout_14.addLayout(self.horizontalLayout_15)
+
+        self.horizontalLayout_14 = QHBoxLayout()
+        self.horizontalLayout_14.setObjectName(u"horizontalLayout_14")
+        self.lbl_subject_id_2 = QLabel(self.scrollAreaWidgetContents_5)
+        self.lbl_subject_id_2.setObjectName(u"lbl_subject_id_2")
+        sizePolicy2.setHeightForWidth(self.lbl_subject_id_2.sizePolicy().hasHeightForWidth())
+        self.lbl_subject_id_2.setSizePolicy(sizePolicy2)
+
+        self.horizontalLayout_14.addWidget(self.lbl_subject_id_2)
+
+        self.line_subject_id_2 = QLineEdit(self.scrollAreaWidgetContents_5)
+        self.line_subject_id_2.setObjectName(u"line_subject_id_2")
+        sizePolicy3.setHeightForWidth(self.line_subject_id_2.sizePolicy().hasHeightForWidth())
+        self.line_subject_id_2.setSizePolicy(sizePolicy3)
+
+        self.horizontalLayout_14.addWidget(self.line_subject_id_2)
+
+        self.line_2 = QFrame(self.scrollAreaWidgetContents_5)
+        self.line_2.setObjectName(u"line_2")
+        self.line_2.setFrameShape(QFrame.Shape.VLine)
+        self.line_2.setFrameShadow(QFrame.Shadow.Sunken)
+
+        self.horizontalLayout_14.addWidget(self.line_2)
+
+        self.lbl_audio_path_2 = QLabel(self.scrollAreaWidgetContents_5)
+        self.lbl_audio_path_2.setObjectName(u"lbl_audio_path_2")
+
+        self.horizontalLayout_14.addWidget(self.lbl_audio_path_2)
+
+        self.line_audio_path_2 = QLineEdit(self.scrollAreaWidgetContents_5)
+        self.line_audio_path_2.setObjectName(u"line_audio_path_2")
+        sizePolicy4.setHeightForWidth(self.line_audio_path_2.sizePolicy().hasHeightForWidth())
+        self.line_audio_path_2.setSizePolicy(sizePolicy4)
+
+        self.horizontalLayout_14.addWidget(self.line_audio_path_2)
+
+        self.btn_audio_browse_2 = QPushButton(self.scrollAreaWidgetContents_5)
+        self.btn_audio_browse_2.setObjectName(u"btn_audio_browse_2")
+
+        self.horizontalLayout_14.addWidget(self.btn_audio_browse_2)
+
+
+        self.verticalLayout_14.addLayout(self.horizontalLayout_14)
+
+        self.scroll_audio_file.setWidget(self.scrollAreaWidgetContents_5)
+
+        self.horizontalLayout_13.addWidget(self.scroll_audio_file)
+
+        self.tab_file_panel.addTab(self.widget1, "")
+        self.tab_2 = QWidget()
+        self.tab_2.setObjectName(u"tab_2")
+        self.horizontalLayout_9 = QHBoxLayout(self.tab_2)
+        self.horizontalLayout_9.setObjectName(u"horizontalLayout_9")
+        self.lbl_video_file = QLabel(self.tab_2)
+        self.lbl_video_file.setObjectName(u"lbl_video_file")
         sizePolicy2.setHeightForWidth(self.lbl_video_file.sizePolicy().hasHeightForWidth())
         self.lbl_video_file.setSizePolicy(sizePolicy2)
 
-        self.gridLayout.addWidget(self.lbl_video_file, 1, 0, 1, 1)
+        self.horizontalLayout_9.addWidget(self.lbl_video_file)
 
-        self.lbl_audio_file = QLabel(self.file_panel)
-        self.lbl_audio_file.setObjectName(u"lbl_audio_file")
-        sizePolicy2.setHeightForWidth(self.lbl_audio_file.sizePolicy().hasHeightForWidth())
-        self.lbl_audio_file.setSizePolicy(sizePolicy2)
-
-        self.gridLayout.addWidget(self.lbl_audio_file, 0, 0, 1, 1)
-
-        self.line_video_path = QLineEdit(self.file_panel)
+        self.line_video_path = QLineEdit(self.tab_2)
         self.line_video_path.setObjectName(u"line_video_path")
-        sizePolicy1.setHeightForWidth(self.line_video_path.sizePolicy().hasHeightForWidth())
-        self.line_video_path.setSizePolicy(sizePolicy1)
+        sizePolicy4.setHeightForWidth(self.line_video_path.sizePolicy().hasHeightForWidth())
+        self.line_video_path.setSizePolicy(sizePolicy4)
 
-        self.gridLayout.addWidget(self.line_video_path, 1, 2, 1, 1)
+        self.horizontalLayout_9.addWidget(self.line_video_path)
 
-        self.btn_audio_browse = QPushButton(self.file_panel)
-        self.btn_audio_browse.setObjectName(u"btn_audio_browse")
-
-        self.gridLayout.addWidget(self.btn_audio_browse, 0, 7, 1, 2)
-
-        self.btn_video_browse = QPushButton(self.file_panel)
+        self.btn_video_browse = QPushButton(self.tab_2)
         self.btn_video_browse.setObjectName(u"btn_video_browse")
 
-        self.gridLayout.addWidget(self.btn_video_browse, 1, 7, 1, 2)
+        self.horizontalLayout_9.addWidget(self.btn_video_browse)
 
-
-        self.verticalLayout_6.addWidget(self.file_panel)
-
-        self.work_space = QWidget(self.centralwidget)
+        self.tab_file_panel.addTab(self.tab_2, "")
+        self.splitter_2.addWidget(self.tab_file_panel)
+        self.work_space = QWidget(self.splitter_2)
         self.work_space.setObjectName(u"work_space")
-        sizePolicy3 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        sizePolicy3.setHorizontalStretch(0)
-        sizePolicy3.setVerticalStretch(0)
-        sizePolicy3.setHeightForWidth(self.work_space.sizePolicy().hasHeightForWidth())
-        self.work_space.setSizePolicy(sizePolicy3)
+        sizePolicy1.setHeightForWidth(self.work_space.sizePolicy().hasHeightForWidth())
+        self.work_space.setSizePolicy(sizePolicy1)
         self.horizontalLayout = QHBoxLayout(self.work_space)
         self.horizontalLayout.setSpacing(1)
         self.horizontalLayout.setObjectName(u"horizontalLayout")
         self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
         self.splitter = QSplitter(self.work_space)
         self.splitter.setObjectName(u"splitter")
-        sizePolicy3.setHeightForWidth(self.splitter.sizePolicy().hasHeightForWidth())
-        self.splitter.setSizePolicy(sizePolicy3)
+        sizePolicy1.setHeightForWidth(self.splitter.sizePolicy().hasHeightForWidth())
+        self.splitter.setSizePolicy(sizePolicy1)
         self.splitter.setOrientation(Qt.Orientation.Horizontal)
         self.content_container = QWidget(self.splitter)
         self.content_container.setObjectName(u"content_container")
@@ -155,16 +247,16 @@ class Ui_MainWindow(object):
         self.scrollarea_spectrogram.setWidgetResizable(True)
         self.scrollAreaWidgetContents = QWidget()
         self.scrollAreaWidgetContents.setObjectName(u"scrollAreaWidgetContents")
-        self.scrollAreaWidgetContents.setGeometry(QRect(0, 0, 554, 412))
+        self.scrollAreaWidgetContents.setGeometry(QRect(0, 0, 554, 387))
         self.horizontalLayout_2 = QHBoxLayout(self.scrollAreaWidgetContents)
         self.horizontalLayout_2.setObjectName(u"horizontalLayout_2")
         self.spectrogram_container = QWidget(self.scrollAreaWidgetContents)
         self.spectrogram_container.setObjectName(u"spectrogram_container")
-        sizePolicy4 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        sizePolicy4.setHorizontalStretch(0)
-        sizePolicy4.setVerticalStretch(0)
-        sizePolicy4.setHeightForWidth(self.spectrogram_container.sizePolicy().hasHeightForWidth())
-        self.spectrogram_container.setSizePolicy(sizePolicy4)
+        sizePolicy5 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        sizePolicy5.setHorizontalStretch(0)
+        sizePolicy5.setVerticalStretch(0)
+        sizePolicy5.setHeightForWidth(self.spectrogram_container.sizePolicy().hasHeightForWidth())
+        self.spectrogram_container.setSizePolicy(sizePolicy5)
 
         self.horizontalLayout_2.addWidget(self.spectrogram_container)
 
@@ -174,17 +266,14 @@ class Ui_MainWindow(object):
 
         self.playback_panel_audio = QGroupBox(self.tab_audio)
         self.playback_panel_audio.setObjectName(u"playback_panel_audio")
-        sizePolicy1.setHeightForWidth(self.playback_panel_audio.sizePolicy().hasHeightForWidth())
-        self.playback_panel_audio.setSizePolicy(sizePolicy1)
+        sizePolicy4.setHeightForWidth(self.playback_panel_audio.sizePolicy().hasHeightForWidth())
+        self.playback_panel_audio.setSizePolicy(sizePolicy4)
         self.horizontalLayout_4 = QHBoxLayout(self.playback_panel_audio)
         self.horizontalLayout_4.setObjectName(u"horizontalLayout_4")
         self.btn_starting_audio = QPushButton(self.playback_panel_audio)
         self.btn_starting_audio.setObjectName(u"btn_starting_audio")
-        sizePolicy5 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        sizePolicy5.setHorizontalStretch(0)
-        sizePolicy5.setVerticalStretch(0)
-        sizePolicy5.setHeightForWidth(self.btn_starting_audio.sizePolicy().hasHeightForWidth())
-        self.btn_starting_audio.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.btn_starting_audio.sizePolicy().hasHeightForWidth())
+        self.btn_starting_audio.setSizePolicy(sizePolicy3)
 
         self.horizontalLayout_4.addWidget(self.btn_starting_audio)
 
@@ -196,8 +285,8 @@ class Ui_MainWindow(object):
 
         self.lbl_time_audio = QLabel(self.playback_panel_audio)
         self.lbl_time_audio.setObjectName(u"lbl_time_audio")
-        sizePolicy5.setHeightForWidth(self.lbl_time_audio.sizePolicy().hasHeightForWidth())
-        self.lbl_time_audio.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.lbl_time_audio.sizePolicy().hasHeightForWidth())
+        self.lbl_time_audio.setSizePolicy(sizePolicy3)
         self.lbl_time_audio.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.horizontalLayout_4.addWidget(self.lbl_time_audio)
@@ -219,14 +308,14 @@ class Ui_MainWindow(object):
 
         self.playback_panel_4 = QGroupBox(self.tab_video)
         self.playback_panel_4.setObjectName(u"playback_panel_4")
-        sizePolicy1.setHeightForWidth(self.playback_panel_4.sizePolicy().hasHeightForWidth())
-        self.playback_panel_4.setSizePolicy(sizePolicy1)
+        sizePolicy4.setHeightForWidth(self.playback_panel_4.sizePolicy().hasHeightForWidth())
+        self.playback_panel_4.setSizePolicy(sizePolicy4)
         self.horizontalLayout_5 = QHBoxLayout(self.playback_panel_4)
         self.horizontalLayout_5.setObjectName(u"horizontalLayout_5")
         self.btn_starting_video = QPushButton(self.playback_panel_4)
         self.btn_starting_video.setObjectName(u"btn_starting_video")
-        sizePolicy5.setHeightForWidth(self.btn_starting_video.sizePolicy().hasHeightForWidth())
-        self.btn_starting_video.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.btn_starting_video.sizePolicy().hasHeightForWidth())
+        self.btn_starting_video.setSizePolicy(sizePolicy3)
 
         self.horizontalLayout_5.addWidget(self.btn_starting_video)
 
@@ -238,8 +327,8 @@ class Ui_MainWindow(object):
 
         self.lbl_time_video = QLabel(self.playback_panel_4)
         self.lbl_time_video.setObjectName(u"lbl_time_video")
-        sizePolicy5.setHeightForWidth(self.lbl_time_video.sizePolicy().hasHeightForWidth())
-        self.lbl_time_video.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.lbl_time_video.sizePolicy().hasHeightForWidth())
+        self.lbl_time_video.setSizePolicy(sizePolicy3)
         self.lbl_time_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.horizontalLayout_5.addWidget(self.lbl_time_video)
@@ -254,8 +343,8 @@ class Ui_MainWindow(object):
         self.splitter.addWidget(self.content_container)
         self.settings_panel = QWidget(self.splitter)
         self.settings_panel.setObjectName(u"settings_panel")
-        sizePolicy4.setHeightForWidth(self.settings_panel.sizePolicy().hasHeightForWidth())
-        self.settings_panel.setSizePolicy(sizePolicy4)
+        sizePolicy5.setHeightForWidth(self.settings_panel.sizePolicy().hasHeightForWidth())
+        self.settings_panel.setSizePolicy(sizePolicy5)
         self.settings_panel.setMinimumSize(QSize(300, 0))
         self.verticalLayout = QVBoxLayout(self.settings_panel)
         self.verticalLayout.setObjectName(u"verticalLayout")
@@ -271,8 +360,8 @@ class Ui_MainWindow(object):
         self.verticalLayout_2.setObjectName(u"verticalLayout_2")
         self.lbl_analysis_file = QLabel(self.tab_default_analyze)
         self.lbl_analysis_file.setObjectName(u"lbl_analysis_file")
-        sizePolicy5.setHeightForWidth(self.lbl_analysis_file.sizePolicy().hasHeightForWidth())
-        self.lbl_analysis_file.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.lbl_analysis_file.sizePolicy().hasHeightForWidth())
+        self.lbl_analysis_file.setSizePolicy(sizePolicy3)
 
         self.verticalLayout_2.addWidget(self.lbl_analysis_file)
 
@@ -400,21 +489,21 @@ class Ui_MainWindow(object):
 
         self.scrollarea_result = QScrollArea(self.tab_default_analyze)
         self.scrollarea_result.setObjectName(u"scrollarea_result")
-        sizePolicy4.setHeightForWidth(self.scrollarea_result.sizePolicy().hasHeightForWidth())
-        self.scrollarea_result.setSizePolicy(sizePolicy4)
+        sizePolicy5.setHeightForWidth(self.scrollarea_result.sizePolicy().hasHeightForWidth())
+        self.scrollarea_result.setSizePolicy(sizePolicy5)
         self.scrollarea_result.setAutoFillBackground(True)
         self.scrollarea_result.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scrollarea_result.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
         self.scrollarea_result.setWidgetResizable(True)
         self.scrollAreaWidgetContents_2 = QWidget()
         self.scrollAreaWidgetContents_2.setObjectName(u"scrollAreaWidgetContents_2")
-        self.scrollAreaWidgetContents_2.setGeometry(QRect(0, 0, 319, 216))
+        self.scrollAreaWidgetContents_2.setGeometry(QRect(0, 0, 313, 191))
         self.verticalLayout_13 = QVBoxLayout(self.scrollAreaWidgetContents_2)
         self.verticalLayout_13.setObjectName(u"verticalLayout_13")
         self.text_result = QTextEdit(self.scrollAreaWidgetContents_2)
         self.text_result.setObjectName(u"text_result")
-        sizePolicy4.setHeightForWidth(self.text_result.sizePolicy().hasHeightForWidth())
-        self.text_result.setSizePolicy(sizePolicy4)
+        sizePolicy5.setHeightForWidth(self.text_result.sizePolicy().hasHeightForWidth())
+        self.text_result.setSizePolicy(sizePolicy5)
 
         self.verticalLayout_13.addWidget(self.text_result)
 
@@ -429,8 +518,8 @@ class Ui_MainWindow(object):
         self.verticalLayout_10.setObjectName(u"verticalLayout_10")
         self.group_distance_corr = QGroupBox(self.tab_test_analyze)
         self.group_distance_corr.setObjectName(u"group_distance_corr")
-        sizePolicy3.setHeightForWidth(self.group_distance_corr.sizePolicy().hasHeightForWidth())
-        self.group_distance_corr.setSizePolicy(sizePolicy3)
+        sizePolicy1.setHeightForWidth(self.group_distance_corr.sizePolicy().hasHeightForWidth())
+        self.group_distance_corr.setSizePolicy(sizePolicy1)
         self.verticalLayout_11 = QVBoxLayout(self.group_distance_corr)
         self.verticalLayout_11.setObjectName(u"verticalLayout_11")
         self.horizontalLayout_7 = QHBoxLayout()
@@ -455,19 +544,19 @@ class Ui_MainWindow(object):
 
         self.scrollarea_dist_result = QScrollArea(self.group_distance_corr)
         self.scrollarea_dist_result.setObjectName(u"scrollarea_dist_result")
-        sizePolicy3.setHeightForWidth(self.scrollarea_dist_result.sizePolicy().hasHeightForWidth())
-        self.scrollarea_dist_result.setSizePolicy(sizePolicy3)
+        sizePolicy1.setHeightForWidth(self.scrollarea_dist_result.sizePolicy().hasHeightForWidth())
+        self.scrollarea_dist_result.setSizePolicy(sizePolicy1)
         self.scrollarea_dist_result.setAutoFillBackground(True)
         self.scrollarea_dist_result.setWidgetResizable(True)
         self.scrollAreaWidgetContents_3 = QWidget()
         self.scrollAreaWidgetContents_3.setObjectName(u"scrollAreaWidgetContents_3")
-        self.scrollAreaWidgetContents_3.setGeometry(QRect(0, 0, 297, 134))
+        self.scrollAreaWidgetContents_3.setGeometry(QRect(0, 0, 291, 121))
         self.horizontalLayout_11 = QHBoxLayout(self.scrollAreaWidgetContents_3)
         self.horizontalLayout_11.setObjectName(u"horizontalLayout_11")
         self.text_dist_result = QTextEdit(self.scrollAreaWidgetContents_3)
         self.text_dist_result.setObjectName(u"text_dist_result")
-        sizePolicy3.setHeightForWidth(self.text_dist_result.sizePolicy().hasHeightForWidth())
-        self.text_dist_result.setSizePolicy(sizePolicy3)
+        sizePolicy1.setHeightForWidth(self.text_dist_result.sizePolicy().hasHeightForWidth())
+        self.text_dist_result.setSizePolicy(sizePolicy1)
 
         self.horizontalLayout_11.addWidget(self.text_dist_result)
 
@@ -480,8 +569,8 @@ class Ui_MainWindow(object):
 
         self.group_geo_corr = QGroupBox(self.tab_test_analyze)
         self.group_geo_corr.setObjectName(u"group_geo_corr")
-        sizePolicy3.setHeightForWidth(self.group_geo_corr.sizePolicy().hasHeightForWidth())
-        self.group_geo_corr.setSizePolicy(sizePolicy3)
+        sizePolicy1.setHeightForWidth(self.group_geo_corr.sizePolicy().hasHeightForWidth())
+        self.group_geo_corr.setSizePolicy(sizePolicy1)
         self.verticalLayout_12 = QVBoxLayout(self.group_geo_corr)
         self.verticalLayout_12.setObjectName(u"verticalLayout_12")
         self.horizontalLayout_8 = QHBoxLayout()
@@ -513,7 +602,7 @@ class Ui_MainWindow(object):
         self.scrollarea_geo_result.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scrollAreaWidgetContents_4 = QWidget()
         self.scrollAreaWidgetContents_4.setObjectName(u"scrollAreaWidgetContents_4")
-        self.scrollAreaWidgetContents_4.setGeometry(QRect(0, 0, 297, 134))
+        self.scrollAreaWidgetContents_4.setGeometry(QRect(0, 0, 291, 122))
         self.horizontalLayout_10 = QHBoxLayout(self.scrollAreaWidgetContents_4)
         self.horizontalLayout_10.setObjectName(u"horizontalLayout_10")
         self.text_geo_result = QTextEdit(self.scrollAreaWidgetContents_4)
@@ -536,19 +625,23 @@ class Ui_MainWindow(object):
 
         self.horizontalLayout.addWidget(self.splitter)
 
+        self.splitter_2.addWidget(self.work_space)
 
-        self.verticalLayout_6.addWidget(self.work_space)
+        self.verticalLayout_6.addWidget(self.splitter_2)
+
+
+        self.verticalLayout_15.addWidget(self.widget)
 
         self.playback_panel_all = QGroupBox(self.centralwidget)
         self.playback_panel_all.setObjectName(u"playback_panel_all")
-        sizePolicy1.setHeightForWidth(self.playback_panel_all.sizePolicy().hasHeightForWidth())
-        self.playback_panel_all.setSizePolicy(sizePolicy1)
+        sizePolicy4.setHeightForWidth(self.playback_panel_all.sizePolicy().hasHeightForWidth())
+        self.playback_panel_all.setSizePolicy(sizePolicy4)
         self.horizontalLayout_3 = QHBoxLayout(self.playback_panel_all)
         self.horizontalLayout_3.setObjectName(u"horizontalLayout_3")
         self.btn_play_all = QPushButton(self.playback_panel_all)
         self.btn_play_all.setObjectName(u"btn_play_all")
-        sizePolicy5.setHeightForWidth(self.btn_play_all.sizePolicy().hasHeightForWidth())
-        self.btn_play_all.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.btn_play_all.sizePolicy().hasHeightForWidth())
+        self.btn_play_all.setSizePolicy(sizePolicy3)
 
         self.horizontalLayout_3.addWidget(self.btn_play_all)
 
@@ -560,14 +653,14 @@ class Ui_MainWindow(object):
 
         self.label_time_all = QLabel(self.playback_panel_all)
         self.label_time_all.setObjectName(u"label_time_all")
-        sizePolicy5.setHeightForWidth(self.label_time_all.sizePolicy().hasHeightForWidth())
-        self.label_time_all.setSizePolicy(sizePolicy5)
+        sizePolicy3.setHeightForWidth(self.label_time_all.sizePolicy().hasHeightForWidth())
+        self.label_time_all.setSizePolicy(sizePolicy3)
         self.label_time_all.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.horizontalLayout_3.addWidget(self.label_time_all)
 
 
-        self.verticalLayout_6.addWidget(self.playback_panel_all)
+        self.verticalLayout_15.addWidget(self.playback_panel_all)
 
         MainWindow.setCentralWidget(self.centralwidget)
         self.menubar = QMenuBar(MainWindow)
@@ -580,8 +673,9 @@ class Ui_MainWindow(object):
 
         self.retranslateUi(MainWindow)
 
+        self.tab_file_panel.setCurrentIndex(0)
         self.tab_content.setCurrentIndex(1)
-        self.tab_analyze.setCurrentIndex(1)
+        self.tab_analyze.setCurrentIndex(0)
 
 
         QMetaObject.connectSlotsByName(MainWindow)
@@ -593,10 +687,16 @@ class Ui_MainWindow(object):
         self.btn_open_file.setText(QCoreApplication.translate("MainWindow", u"Open File...", None))
         self.btn_save_csv.setText(QCoreApplication.translate("MainWindow", u"Save as CSV", None))
         self.btn_save_pdf.setText(QCoreApplication.translate("MainWindow", u"Save as PDF", None))
-        self.lbl_video_file.setText(QCoreApplication.translate("MainWindow", u"Video File", None))
-        self.lbl_audio_file.setText(QCoreApplication.translate("MainWindow", u"Audio File", None))
+        self.lbl_subject_id.setText(QCoreApplication.translate("MainWindow", u"Subject ID", None))
+        self.lbl_audio_path.setText(QCoreApplication.translate("MainWindow", u"Ch 1 File Path", None))
         self.btn_audio_browse.setText(QCoreApplication.translate("MainWindow", u"Browse", None))
+        self.lbl_subject_id_2.setText(QCoreApplication.translate("MainWindow", u"Subject ID", None))
+        self.lbl_audio_path_2.setText(QCoreApplication.translate("MainWindow", u"Ch 2 File Path", None))
+        self.btn_audio_browse_2.setText(QCoreApplication.translate("MainWindow", u"Browse", None))
+        self.tab_file_panel.setTabText(self.tab_file_panel.indexOf(self.widget1), QCoreApplication.translate("MainWindow", u"Audio Files", None))
+        self.lbl_video_file.setText(QCoreApplication.translate("MainWindow", u"Video File", None))
         self.btn_video_browse.setText(QCoreApplication.translate("MainWindow", u"Browse", None))
+        self.tab_file_panel.setTabText(self.tab_file_panel.indexOf(self.tab_2), QCoreApplication.translate("MainWindow", u"Video File", None))
         self.btn_starting_audio.setText(QCoreApplication.translate("MainWindow", u"Sync", None))
         self.lbl_time_audio.setText(QCoreApplication.translate("MainWindow", u"00:00 / 00:00", None))
         self.tab_content.setTabText(self.tab_content.indexOf(self.tab_audio), QCoreApplication.translate("MainWindow", u"Audio Spectrogram", None))
