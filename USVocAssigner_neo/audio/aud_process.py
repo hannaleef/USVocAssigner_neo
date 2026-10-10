@@ -10,29 +10,25 @@ import scipy as sc
 global p_ref
 p_ref = 2e-5
 
-
 #setting the values for STFT
-def set_stft() : 
+def set_stft() :
     print("="*20,"\n\n"
         "{Short Term Fourier Transform(STFT) Settings}\n"
         )
     n_fft = int(input("n_fft(FFT window size)\n >> "))
     hop_length = int(input("hop_length(the step size between analysis windows)\n >> "))
     print("\n","="*20, "\n")
-        
+
     return n_fft, hop_length
 
-def mask_label(Data_aud) : 
-    voltage_mic = Data_aud["voltage"]
-    time = Data_aud["time"]
-    duration_idx = Data_aud["labels"]
-    sr = Data_aud["sr"]
+
+def mask_label(sr, voltage, time, label_idx) :
     #make the mask for the label
     mask = np.zeros_like(time, dtype=bool)
 
     time_idx = []
 
-    for i in duration_idx : 
+    for i in label_idx :
         onset_idx = i[0]
         offset_idx = i[1]
         mask[onset_idx:offset_idx] = True
@@ -41,34 +37,30 @@ def mask_label(Data_aud) :
 
     return masked_voltage
 
+
 def extract_usv(sr, onsets, offsets) :
 
     labels_idx = []
 
-    for i in range(len(onsets)) : 
+    for i in range(len(onsets)) :
         onset_idx = int(onsets[i] * sr)
         offset_idx = int(offsets[i] * sr)
         labels_idx.append([onset_idx, offset_idx])
 
     return labels_idx
 
-def get_amplitude(IDs, Data_aud) : 
 
-    for ID in IDs : 
-        if "response_freqs" in Data_aud[ID] : 
-            Data_aud[ID] = cal_abs_db(Data_aud[ID])
-        else : 
-            Data_aud[ID] = cal_sens_db(Data_aud[ID])
+def get_amplitude(AudioData) :
 
-    return Data_aud
+      if response_freqs in AudioData :
+          amplitude = cal_abs_db(AudioData)
+      else :
+          amplitude = cal_sens_db(AudioData)
 
+    return amplitude
 
-
-
-#===================================================#
-
-#voltage preprocessing, removing the gain 
-def prepre_process(voltage, gain) : 
+#voltage preprocessing, removing the gain
+def prepre_process(voltage, gain) :
     #remove DC bias
     voltage_rem_bias = voltage - np.mean(voltage)
     #remove amplifier gain
@@ -77,74 +69,63 @@ def prepre_process(voltage, gain) :
     you have to add some code here to correct the values"""
     return voltage_mic
 
-#===================================================#
+def do_stft(AudioData, n_fft, hop_length) :
 
-def do_stft(IDs, Data_aud, n_fft, hop_length) : 
+      voltage = AudioData.masked_voltage
+      sr = AudioData.sr
 
-    for ID in IDs : 
-        voltage = Data_aud[ID]["masked_voltage"]
-        sr = Data_aud[ID]["sr"]
+      stft_result = lb.stft(
+      voltage,
+      n_fft = n_fft,
+      hop_length = hop_length,
+      window = 'hann',
+      center = False
+      )
 
-        stft_result = lb.stft(
-        voltage, 
-        n_fft = n_fft, 
-        hop_length = hop_length,
-        window = 'hann',
-        center = False
-        )
+      #set the window
+      window_type = 'hann'
+      window = sc.signal.windows.get_window(
+          window_type,
+          n_fft,
+          fftbins=True
+      )
+      #define window_sum to use for
+      #recovering the amplitude of sin wave
+      window_sum = np.sum(window)
 
-        #set the window
-        window_type = 'hann'
-        window = sc.signal.windows.get_window(
-            window_type,
-            n_fft,
-            fftbins=True
-        )
-        #define window_sum to use for 
-        #recovering the amplitude of sin wave 
-        window_sum = np.sum(window)
+      magnitude = np.abs(stft_result)
+      voltage_peak = magnitude / window_sum
 
-        magnitude = np.abs(stft_result)
-        voltage_peak = magnitude / window_sum
+      if n_fft % 2 == 0 :
+          voltage_peak[1:-1, :] *= 2
+      else :
+          voltage_peak[1:, :] *= 2
 
-        if n_fft % 2 == 0 : 
-            voltage_peak[1:-1, :] *= 2
-        else : 
-            voltage_peak[1:, :] *= 2
+      voltage_rms = voltage_peak / np.sqrt(2)
+      frequency = np.fft.rfftfreq(n_fft, d=1/sr )
 
-        voltage_rms = voltage_peak / np.sqrt(2)
-        frequency = np.fft.rfftfreq(n_fft, d=1/sr )
-
-        Data_aud[ID]["stft_result"] = stft_result
-        Data_aud[ID]["voltage_rms"] = voltage_rms
-        Data_aud[ID]["frequency"] = frequency
-    
-
-    return Data_aud
-
-#===================================================#
-
+    return stft_result, voltage_rms, frequency
 
 #gain frequency_correction_db
 #calculate dB SPL
-def cal_abs_db(Data_aud) :
-    voltage_rms = Data_aud["voltage_rms"]
-    sensitivity_dbv_pa = Data_aud["sensitivity"]
-    stft_result = Data_aud["stft_result"]
-    frequency = Data_aud["frequency"]
-    response_freqs = Data_aud["response_freqs"]
-    response_db = Data_aud["response_db"]
+def cal_abs_db(AudioData) :
+    voltage_rms = AudioData.voltage_rms
+    sensitivity_dbv_pa = AudioData.sensitivity_dbv_pa
+    stft_result = AudioData.stft_result
+    frequency = AudioData.frequency
+    response_freqs = AudioData.response["response_freqs"]
+    response_db = AudioData.response["response_db"]
 
     #correct frequency by using frequency response
-    frequency_correction_db = np.interp( 
-        frequency, 
-        response_freqs, 
+    frequency_correction_db = np.interp(
+        frequency,
+        response_freqs,
         response_db
         )
 
     #correct frequency by using sensitivity
     sensitivity_freq_corr_db = (
-        sensitivity_dbv_pa 
+        sensitivity_dbv_pa
         + frequency_correction_db
         )
 
@@ -161,17 +142,16 @@ def cal_abs_db(Data_aud) :
             pressure_rms,
             np.finfo(float).tiny
         ) / p_ref )
+        
+    amplitude = spl_db
 
-    Data_aud["amplitude"] = spl_db
+    return amplitude
 
-    return Data_aud
+def cal_sens_db(AudioData) :
 
-
-def cal_sens_db(Data_aud) : 
-
-    sensitivity_dbv_pa = Data_aud["sensitivity"]
-    voltage_rms = Data_aud["voltage_rms"]
-    voltage = Data_aud["masked_voltage"]
+    sensitivity_dbv_pa = AudioData.sensitivity_dbv_pa
+    voltage_rms = AudioData.voltage_rms
+    voltage = AudioData.masked_voltage
 
     sensitivity_v_pa = 10 ** (sensitivity_dbv_pa / 20)
 
@@ -184,6 +164,6 @@ def cal_sens_db(Data_aud) :
             np.finfo(float).tiny
         ) / p_ref)
 
-    Data_aud["amplitude"] = spl_db
+    amplitude = spl_db
 
-    return Data_aud
+    return amplitude

@@ -5,14 +5,14 @@ import aud_process as ap
 import pandas as pd
 
 
-def align_label(label_path, sr) : 
-    (i, header_row) = DL.find_header_row(label_path)
+def align_label(label_path, sr) :
+    (i, header_row) = dl.find_header_row(label_path)
     df = pd.read_csv(label_path, skiprows = i)
     n=0
 
     print(" Check the header and choose the number of header \n"
             " of the response of onset and offset that you want to analyze. ")
-    for j in header_row : 
+    for j in header_row :
         print(n,":", j)
         n=n+1
 
@@ -29,7 +29,6 @@ def align_label(label_path, sr) :
     offsets = df[header_row[off]]
     labels_idx = []
 
-    labels_idx = AP.extract_usv(sr, onsets, offsets)
+    labels_idx = ap.extract_usv(sr, onsets, offsets)
 
     return labels_idx
-
