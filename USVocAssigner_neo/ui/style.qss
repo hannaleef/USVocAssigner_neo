@@ -1,0 +1,204 @@
+/* ui/style.qss — USVocAssigner charcoal + cyan theme
+   Attached Designer preview: background #1E1E1E, panel #2B2B2B, accent cyan.
+   Colors are intentionally separated from STFT spectrogram lookup table.
+   Avoid styling every QWidget globally: video canvas and graph background
+   are managed by QVideoWidget and pyqtgraph respectively. */
+
+QMainWindow, QWidget#centralwidget, QWidget#work_space {
+    background-color: #1E1E1E;
+    color: #F1F3F5;
+    font-family: "Segoe UI", "Malgun Gothic";
+    font-size: 12px;
+}
+
+QWidget#content_container, QWidget#settings_panel,
+QWidget#tab_audio, QWidget#tab_video,
+QWidget#tab_default_analyze, QWidget#tab_test_analyze,
+QWidget#scrollAreaWidgetContents, QWidget#scrollAreaWidgetContents_2,
+QWidget#scrollAreaWidgetContents_3, QWidget#scrollAreaWidgetContents_4,
+QWidget#soectrogram_container {
+    background-color: #1E1E1E;
+    color: #F1F3F5;
+}
+
+QGroupBox {
+    background-color: #252525;
+    color: #F1F3F5;
+    border: 1px solid #55585B;
+    border-radius: 7px;
+    margin-top: 12px;
+    padding: 10px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0px 5px;
+    color: #F1F3F5;
+    background-color: #252525;
+}
+
+QLabel {
+    background: transparent;
+    color: #E8EDF1;
+}
+
+QPushButton {
+    background-color: #2D2D2D;
+    color: #F1F3F5;
+    border: 1px solid #3C4044;
+    border-radius: 6px;
+    padding: 6px 12px;
+    min-height: 20px;
+}
+
+QPushButton:hover {
+    background-color: #363E42;
+    border: 1px solid #567986;
+}
+
+QPushButton:pressed {
+    background-color: #25434C;
+    border: 1px solid #40C9DF;
+}
+
+QPushButton:disabled {
+    background-color: #262626;
+    color: #777D83;
+    border-color: #33373B;
+}
+
+QPushButton:focus {
+    border: 1px solid #40C9DF;
+}
+
+/* 'Run Analysis' 및 'Plot Spectrogram' 버튼만 살짝 강조 */
+QPushButton#btn_run_analysis, QPushButton#btn_plot_spectrogram {
+    background-color: #245364;
+    border: 1px solid #3FAAC2;
+    color: #F7FDFF;
+    font-weight: 600;
+}
+QPushButton#btn_run_analysis:hover, QPushButton#btn_plot_spectrogram:hover {
+    background-color: #2A7187;
+}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit,
+QPlainTextEdit, QComboBox {
+    background-color: #2D2D2D;
+    color: #F1F3F5;
+    border: 1px solid #484C4F;
+    border-radius: 5px;
+    padding: 5px 7px;
+    selection-background-color: #3C9CB3;
+    selection-color: #FFFFFF;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
+    border: 1px solid #40C9DF;
+}
+
+QLineEdit:read-only {
+    background-color: #292929;
+    color: #C8D1D6;
+}
+
+QTabWidget::pane {
+    background-color: #292929;
+    border: 1px solid #414548;
+    border-radius: 6px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background-color: #222222;
+    color: #C2CBD0;
+    border: 1px solid #3B3F43;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 8px 15px;
+    margin-right: 2px;
+    min-width: 80px;
+}
+
+QTabBar::tab:selected {
+    background-color: #303030;
+    color: #F8FBFC;
+    border: 1px solid #555C60;
+    border-bottom: 2px solid #40C9DF;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #303739;
+}
+
+QScrollArea {
+    border: none;
+    background-color: #222222;
+}
+
+QScrollBar:vertical {
+    background: #252525;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #555C62;
+    border-radius: 5px;
+    min-height: 22px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+QSlider::groove:horizontal {
+    background-color: #676B70;
+    height: 5px;
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal {
+    background-color: #40C9DF;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background-color: #40C9DF;
+    border: 3px solid #34464B;
+    border-radius: 9px;
+    width: 18px;
+    height: 18px;
+    margin: -8px 0;
+}
+
+QSplitter::handle {
+    background-color: #373C40;
+    width: 4px;
+}
+QSplitter::handle:hover {
+    background-color: #40C9DF;
+}
+
+QMenuBar, QMenu {
+    background-color: #242424;
+    color: #F1F3F5;
+}
+QMenuBar::item:selected, QMenu::item:selected {
+    background-color: #36525C;
+}
+QStatusBar {
+    background-color: #1E1E1E;
+    color: #BAC5CB;
+    border-top: 1px solid #353535;
+}
+
+QToolTip {
+    background-color: #30363A;
+    color: #F7FCFF;
+    border: 1px solid #4A7380;
+    padding: 5px;
+}

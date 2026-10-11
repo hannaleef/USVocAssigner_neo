@@ -1,224 +1,158 @@
-# import files
-# the file to analyze : Wav, freq_resp of mic,
-# gain function(if it exists), Label file(to increase the accuracy)
+# [audio/data_load.py] 마이크 채널 단위 데이터 관리
+# 5분 * 250 kS/s * 4채널은 원본만도 수백 MB 이상이므로
+# 가능하면 mmap=True로 WAV를 읽어 '전체 파일의 float 복사'를 피한다.
+# AudioData.samples는 원본 PCM 또는 float 배열이며, 분석 시 필요한 부분만
+# normalized float32로 변환한다. 이 값은 물리적 전압[V]이 아니다.
 
-#custom modules
-import audio.aud_process as ap
-import audio.voc_label as vl
+from dataclasses import dataclass
+from pathlib import Path
 
-#file path reading
-import tkinter as tk
-from tkinter import filedialog
-import sys
-import csv
-from matplotlib.ticker import SymmetricalLogLocator
-import scipy as sc
-import pandas as pd
 import numpy as np
-import warnings
-
-warnings.filterwarnings("ignore")
-
-class AudioData : 
-	def __init__(self) : 
-		self.ID = get_id()
-		self.audio_path = get_audio_path()
-		self.sr, self.voltage, self.time = data_volt(self.audio_path)
-		self.sensitivity_dbv_pa, self.gain, self.resp_path = get_voltage_corr()
-		if self.resp_path != None : 
-			self.response = align_freq_resp(self.resp_path)
-		self.label_idx, self.masked_voltage = get_label(self.sr, self.voltage, self.time)
-		
-	def get_amp(self, n_fft, hop_length) : 
-		self.stft_result, self.voltage_rms, self.frequency = ap.do_stft(self, n_fft, hop_length)
-		self.amplitude = ap.get_amplitude(self)
-		
-	def get_assign(self, assign_set) : 
-		self.assign_set = assign_set
+import pandas as pd
+from scipy.io import wavfile
 
 
-def set_AudioData() : 
-	num_mic = get_num_mic()
-	audio_dataset = []
-	for i in range(num_mic) : 
-		audio_dataset.append(AudioData())
-	return audio_dataset
+@dataclass(frozen=True)
+class USVEvent:
+    """녹음 시작점 기준 USV 시간구간 + 선택적인 주파수 범위.
 
-def get_num_mic() : 
-	num_mic = int(input("Please enter the number of the microphone channels. \n"
-											" >> "))
-	return num_mic
+    fmin_hz/fmax_hz가 제공되면 해당 USV 라벨의 주파수 대역만 분석하고
+    그래프 ID 주석을 fmax_hz 바로 위에 배치한다. 단위는 Hz와 초(s).
+    """
+    onset_s: float
+    offset_s: float
+    fmin_hz: float | None = None
+    fmax_hz: float | None = None
 
-def get_audio_path() : 
-	print("\n","="*28,"\n   YOUR FILE PATH  \n","   >> ",end="")
-  root = tk.Tk()
-  root.withdraw()
-
-  aud_path = filedialog.askopenfilename(
-  title="audio 파일 선택",
-  filetypes=[
-      ("wav files", "*.wav"),
-      ("All files", "*.*")
-      ]
-  )
-
-  if aud_path == (None or ""):
-      print("You chose NO file. ")
-      return None
-	
-	print(aud_path,"\n\n", "="*28)
-	return aud_path
-
-def get_voltage_corr() : 
-	sensitivity_dbv_pa = int(input(" Please enter the sensitivity of the mic.(dBV/Pa) \n"
-                               "    >> "))
-  print("\n")
-  gain = int(input(" Please enter the gain of the circuit. \n"
-            "    >> "))
-  print("\n\n")
-  
-  ans_cal = input("Do you need calibration or frequency response correction? [y/n]"
-            " >> ")
-
-  if ans_cal == "y" :
-    #ask some information about calculating dB SPL
-    print("We need frequency response csv file. ")
-    resp_path = select_csv()
-	  return sensitivity_dbv_pa, gain, resp_path
-	else : 
-		return sensitivity_dbv_pa, gain, None
+    def __post_init__(self):
+        if (not np.isfinite(self.onset_s) or not np.isfinite(self.offset_s)
+            or self.onset_s < 0 or self.offset_s <= self.onset_s):
+            raise ValueError("USV onset/offset must satisfy 0 <= onset < offset")
+        if (self.fmin_hz is None) != (self.fmax_hz is None):
+            raise ValueError("Frequency bounds must be both provided or both omitted.")
+        if self.fmin_hz is not None:
+            if (not np.isfinite(self.fmin_hz) or not np.isfinite(self.fmax_hz)
+                or self.fmin_hz < 0 or self.fmax_hz <= self.fmin_hz):
+                raise ValueError("Invalid USV frequency interval in Hz.")
 
 
-def get_id() : 
-	ID = (input("Enter microphone's or subject's ID. \n")
-	return ID
+@dataclass
+class AudioData:
+    """마이크 채널 하나의 원본 데이터. channel_id는 실제 mouse_id가 아니다."""
+    channel_id: str
+    path: Path | None
+    sr: int
+    samples: np.ndarray  # raw PCM (possibly memory mapped), or float samples
 
-def get_label(sr, voltage, time) : 
-	#Get the USV labels data
+    @property
+    def duration_s(self) -> float:
+        """샘플 개수를 sampling rate로 나누어 녹음 길이[초] 반환."""
+        return len(self.samples) / self.sr
 
-  ans_label = input("Do you have USV labels for the data? [y/n] \n"
-              " >> ")
-  if ans_label == "y":
+    def slice_float(self, start_sample: int, stop_sample: int) -> np.ndarray:
+        """필요 구간만 정규화 float32 배열로 가져온다. 전체 WAV 복사는 하지 않는다."""
+        start = max(0, int(start_sample))
+        stop = min(len(self.samples), int(stop_sample))
+        raw = self.samples[start:stop]
 
-	  label_path = select_csv()
-	  label_idx = (
-	      vl.align_label(
-	                  label_path, sr
-	                  ))
-	  #It has labels with [index of onset, index of offset]
-	  masked_voltage = (
-	      ap.mask_label(sr, voltage, time, label_idx))
-	  return label_idx, masked_voltage
+        if np.issubdtype(raw.dtype, np.unsignedinteger):
+            # 8-bit PCM (uint8 등)은 가운데 값(예: 128)이 0 신호이다.
+            midpoint = float(1 << (np.iinfo(raw.dtype).bits - 1))
+            return (raw.astype(np.float32) - midpoint) / midpoint
 
-  else :
-    pass
-    #refer the code in MSA2
+        if np.issubdtype(raw.dtype, np.signedinteger):
+            # int16, int32 PCM: 해당 비트 수의 부호 정수 범위를 [-1,1)에 대응.
+            # scipy.io.wavfile의 24-bit PCM -> left-justified int32도 처리한다.
+            scale = float(1 << (np.iinfo(raw.dtype).bits - 1))
+            return raw.astype(np.float32) / scale
 
-#store the voltage value and make the list of time
-def data_volt(aud_path) :
+        if np.issubdtype(raw.dtype, np.floating):
+            # float WAV나 합성 테스트 데이터는 이미 상대 진폭이라고 가정.
+            return raw.astype(np.float32, copy=False)
 
-    sr, voltage = sc.io.wavfile.read(aud_path)
-    time_interval = 1 / sr
-    time = list(range(len(voltage)))
-    for i in range(len(voltage)) :
-        time[i] =i * time_interval
-    return sr, voltage, time
+        raise TypeError(f"Unsupported WAV sample dtype: {raw.dtype}")
 
-#define and align the information of response of frequency and dB
-def align_freq_resp(resp_path) :
 
-    (i, header_row) = find_header_row(resp_path)
+def load_audio(path: str | Path, channel_id: str, csv_sr=None) -> AudioData:
+    """WAV 또는 명시된 샘플레이트를 가진 단일 파형 CSV를 AudioData로 변환.
 
-    df= pd.read_csv(resp_path, skiprows = i)
-    n=0
-    re_hz,re_db=(0,0)
+    CSV는 숫자 열 하나 또는 'amplitude'/'voltage' 열을 가진다고 가정한다.
+    실제 DAQ CSV에 시간 컬럼이 있다면 시간 간격을 검증한 뒤 조정해야 한다.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".wav":
+        try:
+            sr, samples = wavfile.read(path, mmap=True)
+        except (ValueError, OSError):
+            sr, samples = wavfile.read(path, mmap=False)
+    elif path.suffix.lower() == ".csv":
+        if csv_sr is None or int(csv_sr) <= 0:
+            raise ValueError("CSV waveform requires sampling rate (Hz).")
+        df = pd.read_csv(path)
+        if "amplitude" in df:
+            series = df["amplitude"]
+        elif "voltage" in df:
+            series = df["voltage"]
+        elif df.shape[1] == 1:
+            series = df.iloc[:, 0]
+        else:
+            raise ValueError("CSV needs one waveform column, amplitude or voltage.")
+        samples = pd.to_numeric(series, errors="raise").to_numpy(dtype=np.float32)
+        sr = int(csv_sr)
+    else:
+        raise ValueError("Audio format must be WAV or waveform CSV.")
+    if samples.ndim != 1:
+        raise ValueError(f"{path.name}: one mono channel per audio input.")
+    if sr <= 0 or len(samples) == 0:
+        raise ValueError(f"{path.name}: invalid sample rate or empty recording.")
+    return AudioData(channel_id, path, int(sr), samples)
 
-    print(" Check the header and choose the number of header \n"
-          " of the response of frequency and dB that you want to analyze. ")
-    for j in header_row :
-        print(n,":", j)
-        n=n+1
 
-    re_hz, re_db = map(
-        int,
-        input('Enter like [freqency, dB]\n>> ')
-        .strip("[]() ")
-        .split(",")
-    )
+def load_labels(path, onset="onset", offset="offset", unit="s") -> list[USVEvent]:
+    """CSV/TXT 라벨의 onset/offset을 초(s) 단위 USVEvent로 통일.
 
-    print("\n\n")
+    지원: onset/offset, start/end, onset_s/offset_s, Time Begin/Time End.
+    열 명칭/숫자 단위가 불분명하면 사용자가 입력 형식을 수정해야 한다.
+    TXT는 쉼표/탭/공백/세미콜론으로 구분된 표를 허용한다.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in (".csv", ".txt"):
+        raise ValueError("Label file must be CSV or TXT.")
+    df = pd.read_csv(path, sep=None, engine="python")
+    names = {str(col).strip().lower().replace(" ", "_"): col for col in df.columns}
+    options = [(onset, offset), ("onset_s", "offset_s"),
+               ("start", "end"), ("time_begin", "time_end")]
+    selected = next(((names[a], names[b]) for a,b in options
+                     if a in names and b in names), None)
+    if selected is None:
+        raise ValueError("Label header needs onset/offset (seconds) or start/end.")
+    if unit not in ("s", "ms"):
+        raise ValueError("Label units must be s or ms; automatic unit guessing is unsafe.")
+    multiplier = 0.001 if unit == "ms" else 1.0
+    # 선택적 주파수 열: Avisoft 등에서 Hz 또는 kHz가 제공될 수 있다.
+    # 파일 헤더에 명시한 주파수 단위만 해석하며 Hz/kHz를 추측하지 않는다.
+    freq_options = [
+        ("fmin_hz", "fmax_hz", 1.0),
+        ("freq_min_hz", "freq_max_hz", 1.0),
+        ("low_freq_hz", "high_freq_hz", 1.0),
+        ("fmin_khz", "fmax_khz", 1000.0),
+        ("freq_min_khz", "freq_max_khz", 1000.0),
+    ]
+    freq_columns = next(((names[a], names[b], scale)
+                         for a,b,scale in freq_options if a in names and b in names), None)
+    out = []
+    for index, (a,b) in enumerate(zip(df[selected[0]], df[selected[1]])):
+        if freq_columns is None:
+            out.append(USVEvent(float(a)*multiplier, float(b)*multiplier))
+        else:
+            lo_col, hi_col, scale = freq_columns
+            lo, hi = df.iloc[index][lo_col], df.iloc[index][hi_col]
+            if pd.isna(lo) or pd.isna(hi):
+                out.append(USVEvent(float(a)*multiplier, float(b)*multiplier))
+            else:
+                out.append(USVEvent(float(a)*multiplier, float(b)*multiplier,
+                                    float(lo)*scale, float(hi)*scale))
+    return sorted(out, key=lambda event: event.onset_s)
 
-    response_freqs = df[header_row[re_hz]]
-    response_db = df[header_row[re_db]]
-    response = {
-        "response_freqs" : response_freqs,
-        "response_db" : response_db
-        }
-
-    return response
-
-#현재 값이 숫자인지 판별
-def is_number(value):
-    try:
-        float(value)
-        return True
-    except ValueError:
-        return False
-
-#file_path 받아 header 찾기
-def find_header_row(file_path):
-    with open(file_path, "r", encoding="utf-8-sig", newline="") as file:
-        rows = list(csv.reader(file))
-
-    for i in range(len(rows) - 1):
-        current_row = rows[i]
-        next_row = rows[i + 1]
-
-        # 빈 행 제외
-        if not current_row or not next_row:
-            continue
-
-        # 현재 행과 다음 행의 열 개수가 같은 경우
-        if len(current_row) != len(next_row):
-            continue
-
-        # 현재 행에 문자열이 있는지
-        current_has_text = any(
-            not is_number(value.strip())
-            for value in current_row
-            if value.strip()
-        )
-
-        # 다음 행이 대부분 숫자인지
-        next_numeric = sum(
-            is_number(value.strip())
-            for value in next_row
-            if value.strip()
-        )
-
-        if current_has_text and next_numeric >= len(next_row) * 0.8:
-            return (i, rows[i])
-    return None
-
-#select and read the file
-def select_csv() :
-    print("\n","="*28,"\n   YOUR FILE PATH & NAME  \n","   >> ",end="")
-    root = tk.Tk()
-    root.withdraw()
-
-    file_path = filedialog.askopenfilename(
-    title="CSV 파일 선택",
-    filetypes=[
-        ("CSV files", "*.csv"),
-        ("txt files", "*.txt"),
-        ("All files", "*.*")
-        ]
-    )
-
-    if file_path == None:
-        print("You chose NO file. ")
-        exit("Please check again and retry the program. ")
-
-    print(file_path,"\n\n", "="*28)
-
-    return file_path
+# TODO: 실제 장비 gain, sensitivity, frequency response calibration.
+# TODO: Avisoft 라벨 CSV의 서로 다른 열 이름/단위에 대한 로더 어댑터.

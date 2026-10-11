@@ -1,460 +1,107 @@
+# [video/track_data.py] 영상 추적 CSV -> 개체별 시간·좌표 테이블
+# 우선순위: SLEAP이 제공한 track ID를 보존한다. ID가 없는 CSV만 Hungarian 처리.
+# Hungarian은 프레임당 거리 최소 매칭이며 교차·가림에서 ID swap이 가능하다.
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
-# =========================================================
-# Body-point columns used to calculate mouse center
-# =========================================================
 
-CENTER_X_COLUMNS = [
-    "nose_x",
-    "left_ear_x",
-    "right_ear_x",
-    "torso_x",
-    "tail_base_x"
-]
+def prepare_tracks(raw_df: pd.DataFrame, fps: float) -> pd.DataFrame:
+    """SLEAP columns를 표준화하고 frame_idx -> time_video_s[초] 생성."""
+    if fps <= 0:
+        raise ValueError("Video FPS must be positive.")
+    df = raw_df.rename(columns=lambda col: str(col).replace(".", "_")).copy()
+    if "frame_idx" not in df.columns:
+        raise ValueError("Tracking CSV has no frame_idx column.")
+    df["frame_idx"] = pd.to_numeric(df["frame_idx"], errors="coerce")
+    df = df.dropna(subset=["frame_idx"])
+    df["frame_idx"] = df["frame_idx"].astype(int)
+    df["time_video_s"] = df["frame_idx"] / float(fps)
 
-CENTER_Y_COLUMNS = [
-    "nose_y",
-    "left_ear_y",
-    "right_ear_y",
-    "torso_y",
-    "tail_base_y"
-]
+    x_cols = [col for col in ("nose_x", "left_ear_x", "right_ear_x",
+                              "torso_x", "tail_base_x") if col in df]
+    y_cols = [col for col in ("nose_y", "left_ear_y", "right_ear_y",
+                              "torso_y", "tail_base_y") if col in df]
+    if not x_cols or not y_cols:
+        raise ValueError("Required mouse body point coordinates not found.")
+    for col in set(x_cols + y_cols):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["center_x"] = df[x_cols].mean(axis=1)
+    df["center_y"] = df[y_cols].mean(axis=1)
 
-
-# =========================================================
-# Calculate mouse center
-# =========================================================
-
-def calculate_center(tracking_df):
-
-    tracking_df = tracking_df.copy()
-
-    # 실제 DataFrame에 존재하는 column만 사용
-    x_columns = [
-        col for col in CENTER_X_COLUMNS
-        if col in tracking_df.columns
-    ]
-
-    y_columns = [
-        col for col in CENTER_Y_COLUMNS
-        if col in tracking_df.columns
-    ]
-
-    if not x_columns or not y_columns:
-        raise ValueError(
-            "Could not calculate center coordinates. "
-            "No usable body-point coordinate columns were found."
+    # SLEAP 추적 결과가 'track' 열을 제공하면 자체 track_id에 복사하여 보존.
+    # 기존 track_id 열이 이미 있다면 그것을 우선 사용한다.
+    if "track_id" not in df.columns and "track" in df.columns:
+        df["track_id"] = df["track"]
+    if "track_id" in df.columns:
+        df["track_id"] = df["track_id"].apply(
+            lambda value: str(value) if pd.notna(value)
+            and str(value).strip() not in ("", "nan", "None") else None
         )
-
-    tracking_df["center_x"] = (
-	    tracking_df[x_columns].mean(axis=1,skipna=True)
-	    )
-
-    tracking_df["center_y"] = (
-	    tracking_df[y_columns].mean(axis=1,skipna=True)
-	    )
-
-    return tracking_df
-
-
-# =========================================================
-# Create a new active track
-# =========================================================
-
-def create_track(current_track, frame_id)
-  return {
-    "center_x":
-      float(current_track["center_x"]),
-
-    "center_y":
-      float(current_track["center_y"]),
-
-    "velocity_x": 0.0,
-    "velocity_y": 0.0,
-
-    "last_frame":
-      int(frame_idx),
-
-    "missing_frames": 0
-  }
-
-
-# =========================================================
-# Calculate distance cost matrix
-# =========================================================
-
-def calculate_distance(active_tracks, current_frame, frame_idx):
-  # 기존에 추적 중인 mouse ID
-  active_ids = list(active_tracks.keys())
-
-  # 현재 frame의 detection들의 DataFrame index
-  current_indices = list(current_frame.index)
-
-  # cost matrix 생성
-  distance_cost = np.full(
-    (len(active_ids),len(current_indices)),
-    1e12,
-    dtype=float
-  )
-
-  # -----------------------------------------
-  # each active mouse
-  # -----------------------------------------
-
-  for row_idx, track_id in enumerate(active_ids):
-
-    active_track = active_tracks[track_id]
-
-    # 마지막으로 발견된 frame에서
-    # 현재 frame까지 몇 frame 지났는지
-    frame_gap = max(
-      int(frame_idx)
-      - active_track["last_frame"],
-      1
-    )
-
-    # 이전 위치와 속도를 이용하여
-    # 현재 frame의 예상 위치 계산
-    predicted_x = (
-      active_track["center_x"]
-      +
-      active_track["velocity_x"]
-      * frame_gap
-    )
-
-    predicted_y = (
-      active_track["center_y"]
-      +
-      active_track["velocity_y"]
-      * frame_gap
-    )
-
-    # -----------------------------------------
-    # each current detection
-    # -----------------------------------------
-
-    for col_idx, dataframe_idx in enumerate(current_indices):
-
-      current_track = current_frame.loc[dataframe_idx]
-      current_x = current_track["center_x"]
-      current_y = current_track["center_y"]
-
-      # center 좌표가 없으면 matching 불가능
-      if (
-        pd.isna(current_x)
-        or pd.isna(current_y)
-      ): continue
-
-      # Euclidean distance
-      distance = np.hypot(
-        current_x - predicted_x,
-        current_y - predicted_y
-      )
-
-      distance_cost[row_idx, col_idx] = distance
-
-  return (active_ids, current_indices, distance_cost)
-
-
-# =========================================================
-# Hungarian assignment
-# =========================================================
-
-def match_tracks(
-  active_tracks,
-  current_frame,
-  frame_idx,
-  max_distance
-) :
-  # 기존 mouse가 하나도 없는 경우
-  if len(active_tracks) == 0:
-    return ([], [], list(current_frame.index))
-
-  # 현재 frame에 detection이 하나도 없는 경우
-  if len(current_frame) == 0:
-    return ([], list(active_tracks.keys()), [])
-
-  active_ids, current_indices, distance_cost = calculate_distance(
-    active_tracks,
-    current_frame,
-    frame_idx
-  )
-
-  # Hungarian assignment
-  match_rows, match_cols = (linear_sum_assignment(distance_cost))
-
-  matches = []
-
-  matched_track_ids = set()
-  matched_detection_indices = set()
-
-  # -----------------------------------------
-  # Check each Hungarian assignment
-  # -----------------------------------------
-
-  for row, col in zip(match_rows, match_cols):
-
-    distance = float(distance_cost[row, col])
-    track_id = active_ids[row]
-
-    detection_idx = current_indices[col]
-
-    # Hungarian algorithm이 연결했다고
-    # 무조건 같은 mouse로 인정하지 않음
-    if distance <= max_distance:
-      matches.append(track_id, detection_idx, distance)
-      matched_track_ids.add(track_id)
-      matched_detection_indices.add(detection_idx)
-
-  # -----------------------------------------
-  # 기존 track 중 matching 실패
-  # -----------------------------------------
-
-  unmatched_tracks = [
-    track_id
-    for track_id in active_ids
-    if track_id
-    not in matched_track_ids
-  ]
-
-  # -----------------------------------------
-  # 현재 detection 중 matching 실패
-  # -----------------------------------------
-
-  unmatched_detections = [
-    dataframe_idx
-    for dataframe_idx
-    in current_indices
-    if dataframe_idx
-    not in matched_detection_indices
-  ]
-
-  return (matches, unmatched_tracks, unmatched_detections)
-
-
-# =========================================================
-# Update active track
-# =========================================================
-
-def update_track(active_track, current_track, frame_idx) :
-
-    frame_gap = max(
-        int(frame_idx)
-        - active_track["last_frame"], 1
-    )
-
-    new_x = float( current_track["center_x"])
-
-    new_y = float(current_track["center_y"])
-
-    # -----------------------------------------
-    # Calculate velocity
-    # -----------------------------------------
-
-    velocity_x = (
-        new_x
-        - active_track["center_x"]
-    ) / frame_gap
-
-    velocity_y = (
-        new_y - active_track["center_y"]
-    ) / frame_gap
-
-    # -----------------------------------------
-    # Update track state
-    # -----------------------------------------
-
-    active_track["center_x"] = new_x
-    active_track["center_y"] = new_y
-    
-    active_track["velocity_x"] = velocity_x
-    active_track["velocity_y"] = velocity_y
-
-    active_track["last_frame"] = int(frame_idx)
-
-    active_track["missing_frames"] = 0
-
-
-# =========================================================
-# Identify mouse across frames
-# =========================================================
-	
-def identify_tracks(
-  tracking_df,
-  max_distance,
-  max_missing_frames=5
-):
-
-    if max_distance <= 0:
-      raise ValueError("max_distance must be greater than 0.")
-
-    if max_missing_frames < 0:
-      raise ValueError("max_missing_frames must be 0 or greater.")
-
-    # -----------------------------------------
-    # Calculate center
-    # -----------------------------------------
-
-    tracking_df = calculate_center(tracking_df)
-
-    # 최종 mouse identity
-    tracking_df["mouse_id"] = pd.Series(
-      index=tracking_df.index,
-      dtype="object"
-    )
-
-    # matching이 얼마나 떨어져 있었는지 기록
-    tracking_df["assignment_distance"] = np.nan
-
-
-    # -----------------------------------------
-    # Find frame range
-    # -----------------------------------------
-
-    valid_frames = tracking_df["frame_idx"].dropna()
-
-    if valid_frames.empty:
-      return tracking_df
-
-    first_frame = int(valid_frames.min())
-    last_frame = int(valid_frames.max())
-
-
-    # -----------------------------------------
-    # Track state
-    # -----------------------------------------
-
-    active_tracks = {}
-    next_track_number = 0
-
-    # -----------------------------------------
-    # Process each frame
-    # -----------------------------------------
-
-	  for frame_idx in range(first_frame, last_frame + 1):
-	    current_frame = tracking_df[
-	      tracking_df["frame_idx"]
-	      == frame_idx
-	    ]
-	    # center 좌표가 없는 detection은 제외
-	    current_frame = (
-	      current_frame.dropna(
-	        subset=["center_x", "center_y"]
-	      )
-	    )
-      # =================================================
-      # No existing active tracks
-      # =================================================
-
-    if len(active_tracks) == 0:
-      for (dataframe_idx, current_track) in current_frame.iterrows():
-        track_id = (f"mouse_{next_tracke_number}")
-        next_track_number += 1
-        active_tracks[track_id] = create_track(
-            current_track,
-            frame_idx
-        )
-
-        tracking_df.at[dataframe_idx, "track_id"] = track_id
-        
-        # 처음 만들어진 track은
-        # 이전 frame과의 distance가 없음
-        tracking_df.at[dataframe_idx, "assignment_distance"] = 0.0
-
-      continue
-
-      # =================================================
-      # Match active tracks and current detections
-      # =================================================
-
-      (matches, unmatched_tracks, unmatched_detections) = match_tracks(
-        active_tracks,
-        current_frame,
-        frame_idx,
-        max_distance
-      )
-
-      # =================================================
-      # Update matched tracks
-      # =================================================
-
-      for (track_id, dataframe_idx, distance) in matches:
-        current_track = current_frame.loc[dataframe_idx]
-        update_track(active_tracks[track_id], current_track, frame_idx)
-
-        tracking_df.at[dataframe_idx, "track_id"] = track_id
-        tracking_df.at[dataframe_idx, "assignment_distance"] = distance
-
-
-      # =================================================
-      # Count missing frames
-      # =================================================
-
-      for track_id in unmatched_tracks:
-          active_tracks[track_id]["missing_frames"] += 1
-
-      # =================================================
-      # Remove stale tracks
-      # =================================================
-
-      stale_tracks = [
-        track_id
-        for track_id, track
-        in active_tracks.items()
-        if (
-            track["missing_frames"]
-            > max_missing_frames
-        )
-      ]
-
-      for track_id in stale_tracks:
-        del active_tracks[track_id]
-
-
-      # =================================================
-      # Create new ID for unmatched detections
-      # =================================================
-
-      for dataframe_idx in (unmatched_detections):
-        current_track = current_frame.loc[dataframe_idx]
-        track_id = (f"mouse_{next_track_number}")
-        next_track_number += 1
-
-        active_tracks[track_id] = create_track(current_track, frame_idx)
-
-        tracking_df.at[dataframe_idx, "track_id"] = track_id
-
-  return tracking_df
-
-
-# =========================================================
-# Main interface of track_data.py
-# =========================================================
-
-def process_tracking_data(
-  tracking_df,
-  max_distance,
-  max_missing_frames=5
-):
-
-  if tracking_df is None:
-    raise ValueError("tracking_df is None.")
-
-  required_columns = {"frame_idx"}
-  missing_columns = (required_columns - set(tracking_df.columns))
-
-  if missing_columns:
-    raise ValueError(
-        "Missing required columns: "
-        + ", ".join(sorted(missing_columns))
-    )
-
-  processed_df = identify_tracks(
-    tracking_df,
-    max_distance=max_distance,
-    max_missing_frames=max_missing_frames
-  )
-
-  return processed_df
+    return df
+
+
+def identify_tracks(df: pd.DataFrame, max_distance_px=65.0,
+                    max_missing_frames=5) -> pd.DataFrame:
+    """SLEAP track_id가 없는 데이터에 Hungarian 기반 임시 track_id 부여."""
+    if df.empty:
+        raise ValueError("Tracking table is empty.")
+    if max_distance_px <= 0 or max_missing_frames < 0:
+        raise ValueError("Invalid distance/missing-frames limits.")
+    out = df.copy()
+    out["track_id"] = None
+    # track 상태: [x, y, last_frame, miss]
+    active = {}
+    next_id = 0
+    frame_start, frame_stop = int(out.frame_idx.min()), int(out.frame_idx.max())
+
+    for frame in range(frame_start, frame_stop + 1):
+        current = out[(out.frame_idx == frame) & out.center_x.notna()
+                      & out.center_y.notna()]
+        indices, keys = list(current.index), list(active)
+        costs = np.full((len(keys), len(indices)), 1e9, dtype=float)
+
+        for i, key in enumerate(keys):
+            x, y, last_frame, _ = active[key]
+            for j, idx in enumerate(indices):
+                obs = current.loc[idx]
+                costs[i, j] = np.hypot(x - obs.center_x, y - obs.center_y)
+        matched_keys, matched_indices = set(), set()
+
+        if costs.size:
+            rows, cols = linear_sum_assignment(costs)
+            for i, j in zip(rows, cols):
+                if costs[i, j] > max_distance_px:
+                    continue  # 운동 범위를 벗어난 연결은 기각.
+                key, idx = keys[i], indices[j]
+                obs = current.loc[idx]
+                active[key] = [obs.center_x, obs.center_y, frame, 0]
+                out.at[idx, "track_id"] = key
+                matched_keys.add(key)
+                matched_indices.add(idx)
+
+        for key in keys:
+            if key not in matched_keys:
+                active[key][3] += 1
+        active = {key: val for key, val in active.items()
+                  if val[3] <= max_missing_frames}
+
+        for idx in indices:
+            if idx in matched_indices:
+                continue
+            key = f"track_{next_id}"
+            next_id += 1
+            obs = current.loc[idx]
+            active[key] = [obs.center_x, obs.center_y, frame, 0]
+            out.at[idx, "track_id"] = key
+    return out
+
+
+def process_tracking_data(raw_df, fps, max_distance_px=65.0):
+    """GUI가 호출하는 단일 진입점: SLEAP 기본 track 우선, 없으면 자체 추적."""
+    df = prepare_tracks(raw_df, fps)
+    if "track_id" not in df or df["track_id"].isna().all():
+        return identify_tracks(df, max_distance_px=max_distance_px)
+    # 일부 검출에서 track_id가 누락되면 임의 ID 매핑을 섞지 않고 누락으로 보존.
+    # 실제 발성 개체 판정 단계에서는 track_id가 없는 행은 사용하지 않는다.
+    return df.sort_values(["frame_idx"]).reset_index(drop=True)

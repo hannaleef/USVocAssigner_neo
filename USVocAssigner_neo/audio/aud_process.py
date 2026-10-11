@@ -1,169 +1,83 @@
-#voltage -> masked voltage
-#get the amplitude from voltage and correct the amplitude data
+# [audio/aud_process.py] 다채널 그래프와 ratio-only 분석에 공통으로 사용하는 STFT
+# GUI는 각 채널의 짧은 구간(기본 3초)만 읽어 스펙트로그램을 계산한다.
+# 데이터 단위: 상대 디지털 진폭 -> 20log10(|STFT|); 이는 dB SPL이 아니다.
+# 화면에서 표시할 시간 bin 수만 줄이는 옵션(max_time_bins)은
+# 분석용 특징 함수(event_level)에는 적용하지 않는다.
 
-
-import librosa as lb
-import matplotlib
 import numpy as np
-import scipy as sc
-
-global p_ref
-p_ref = 2e-5
-
-#setting the values for STFT
-def set_stft() :
-    print("="*20,"\n\n"
-        "{Short Term Fourier Transform(STFT) Settings}\n"
-        )
-    n_fft = int(input("n_fft(FFT window size)\n >> "))
-    hop_length = int(input("hop_length(the step size between analysis windows)\n >> "))
-    print("\n","="*20, "\n")
-
-    return n_fft, hop_length
+from scipy.signal import stft
 
 
-def mask_label(sr, voltage, time, label_idx) :
-    #make the mask for the label
-    mask = np.zeros_like(time, dtype=bool)
+def window_spectrogram(
+    audio, start_s, width_s=3.0, n_fft=2048, hop_length=256,
+    fmin=18000.0, fmax=100000.0, max_time_bins=None
+):
+    """
+    입력: AudioData, 시간 구간[초], FFT 길이/step[샘플], Hz 단위 주파수 범위.
+    반환: (레벨[freq,time], 전역 시간축[s], 주파수축[Hz]).
+    """
+    if not 0 < hop_length <= n_fft:
+        raise ValueError("0 < hop_length <= n_fft 조건이 필요합니다.")
+    if width_s <= 0:
+        raise ValueError("width_s must be positive.")
 
-    time_idx = []
+    start_sample = max(0, round(start_s * audio.sr))
+    stop_sample = min(len(audio.samples), round((start_s + width_s) * audio.sr))
+    # 메모리맵 지원 AudioData의 부분 읽기 함수만 사용.
+    signal = audio.slice_float(start_sample, stop_sample)
 
-    for i in label_idx :
-        onset_idx = i[0]
-        offset_idx = i[1]
-        mask[onset_idx:offset_idx] = True
+    if len(signal) < n_fft:
+        return np.empty((0, 0)), np.array([]), np.array([])
 
-    masked_voltage = np.where(mask, voltage_mic, 0)
+    freqs, local_times, spectrum = stft(
+        signal,
+        fs=audio.sr,
+        nperseg=n_fft,
+        noverlap=n_fft - hop_length,
+        window="hann",
+        boundary=None,
+        padded=False,
+    )
 
-    return masked_voltage
+    keep = (freqs >= fmin) & (freqs <= min(fmax, audio.sr / 2))
+    if not keep.any():
+        return np.empty((0, 0)), np.array([]), np.array([])
+
+    # 상대 레벨이다. 전압/압력 캘리브레이션이 없으므로 dB SPL 표기 금지.
+    level_db = 20 * np.log10(np.maximum(np.abs(spectrum[keep]), 1e-12))
+    times_s = local_times + start_sample / audio.sr
+    freqs_hz = freqs[keep]
+
+    if max_time_bins is not None and len(times_s) > max_time_bins:
+        # GUI 화면 픽셀 수보다 훨씬 많은 컬럼은 downsample하여 렌더링 비용 절감.
+        # 단순 subsampling은 화면상 좁은 이벤트를 놓칠 수 있어
+        # 후속 개선 시 peak pooling 또는 multiresolution cache로 교체.
+        step = int(np.ceil(len(times_s) / max_time_bins))
+        times_s = times_s[::step]
+        level_db = level_db[:, ::step]
+
+    return level_db, times_s, freqs_hz
 
 
-def extract_usv(sr, onsets, offsets) :
+def event_level(audio, event, n_fft=1024, hop_length=256):
+    """주어진 USV 구간의 대표 상대 레벨; 검증 전 임시 특징값."""
+    # 라벨에 USV 주파수 범위가 있으면 그 대역만 사용한다.
+    # 없으면 default USV 대역(18kHz 이상)을 사용하며 제한 사항을 결과에서 명시.
+    low_hz = event.fmin_hz if event.fmin_hz is not None else 18000.0
+    high_hz = event.fmax_hz if event.fmax_hz is not None else audio.sr / 2
+    level, _, _ = window_spectrogram(
+        audio, event.onset_s, event.offset_s - event.onset_s,
+        n_fft=n_fft, hop_length=hop_length,
+        fmin=low_hz, fmax=high_hz,
+    )
+    valid = level[np.isfinite(level)]
+    if valid.size == 0:
+        return float("nan")
 
-    labels_idx = []
+    # 상위 25% 스펙트럼 픽셀의 median을 선택하는 경험적 특징 추출 방식.
+    # 샘플 수가 짧거나 배경 잡음이 많은 경우 ground-truth 검증이 필요.
+    threshold = np.percentile(valid, 75)
+    return float(np.median(valid[valid >= threshold]))
 
-    for i in range(len(onsets)) :
-        onset_idx = int(onsets[i] * sr)
-        offset_idx = int(offsets[i] * sr)
-        labels_idx.append([onset_idx, offset_idx])
-
-    return labels_idx
-
-
-def get_amplitude(AudioData) :
-
-      if response_freqs in AudioData :
-          amplitude = cal_abs_db(AudioData)
-      else :
-          amplitude = cal_sens_db(AudioData)
-
-    return amplitude
-
-#voltage preprocessing, removing the gain
-def prepre_process(voltage, gain) :
-    #remove DC bias
-    voltage_rem_bias = voltage - np.mean(voltage)
-    #remove amplifier gain
-    voltage_mic = voltage_rem_bias / gain
-    """If the circuit has variable frequency response,
-    you have to add some code here to correct the values"""
-    return voltage_mic
-
-def do_stft(AudioData, n_fft, hop_length) :
-
-      voltage = AudioData.masked_voltage
-      sr = AudioData.sr
-
-      stft_result = lb.stft(
-      voltage,
-      n_fft = n_fft,
-      hop_length = hop_length,
-      window = 'hann',
-      center = False
-      )
-
-      #set the window
-      window_type = 'hann'
-      window = sc.signal.windows.get_window(
-          window_type,
-          n_fft,
-          fftbins=True
-      )
-      #define window_sum to use for
-      #recovering the amplitude of sin wave
-      window_sum = np.sum(window)
-
-      magnitude = np.abs(stft_result)
-      voltage_peak = magnitude / window_sum
-
-      if n_fft % 2 == 0 :
-          voltage_peak[1:-1, :] *= 2
-      else :
-          voltage_peak[1:, :] *= 2
-
-      voltage_rms = voltage_peak / np.sqrt(2)
-      frequency = np.fft.rfftfreq(n_fft, d=1/sr )
-
-    return stft_result, voltage_rms, frequency
-
-#gain frequency_correction_db
-#calculate dB SPL
-def cal_abs_db(AudioData) :
-    voltage_rms = AudioData.voltage_rms
-    sensitivity_dbv_pa = AudioData.sensitivity_dbv_pa
-    stft_result = AudioData.stft_result
-    frequency = AudioData.frequency
-    response_freqs = AudioData.response["response_freqs"]
-    response_db = AudioData.response["response_db"]
-
-    #correct frequency by using frequency response
-    frequency_correction_db = np.interp(
-        frequency,
-        response_freqs,
-        response_db
-        )
-
-    #correct frequency by using sensitivity
-    sensitivity_freq_corr_db = (
-        sensitivity_dbv_pa
-        + frequency_correction_db
-        )
-
-    #dBV/pa->V/pa
-    sensitivity_freq_corr_v = (
-        10**(sensitivity_freq_corr_db/20)
-        )
-
-    #v_min->v_rms
-    pressure_rms = voltage_rms / sensitivity_freq_corr_v
-
-    spl_db = 20 * np.log10(
-        np.maximum(
-            pressure_rms,
-            np.finfo(float).tiny
-        ) / p_ref )
-        
-    amplitude = spl_db
-
-    return amplitude
-
-def cal_sens_db(AudioData) :
-
-    sensitivity_dbv_pa = AudioData.sensitivity_dbv_pa
-    voltage_rms = AudioData.voltage_rms
-    voltage = AudioData.masked_voltage
-
-    sensitivity_v_pa = 10 ** (sensitivity_dbv_pa / 20)
-
-    #v_min->v_rms
-    pressure_rms = voltage_rms / sensitivity_v_pa
-
-    spl_db = 20 * np.log10(
-        np.maximum(
-            pressure_rms,
-            np.finfo(float).tiny
-        ) / p_ref)
-
-    amplitude = spl_db
-
-    return amplitude
+# 주의: 여러 채널의 레벨을 직접 비교하려면 하드웨어별 감도/gain 보정이 필요.
+# 각 WAV의 실제 녹음 시작 시각이 다르면 별도 시간 offset 정렬도 필요.
