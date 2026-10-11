@@ -25,7 +25,7 @@ class AssignmentResult:
     candidate_errors_db: dict = field(default_factory=dict)
 
 
-def ratio_only_assignment(audio_dataset, events, min_margin_db=3.0,
+def ratio_only_assignment(audio_dataset, events, min_margin_db=0.03,
                           n_fft=1024, hop_length=256,
                           recording_bias_db=None):
     """채널별 동일 시간 구간의 상대 레벨을 비교하는 기준 알고리즘."""
@@ -43,9 +43,26 @@ def ratio_only_assignment(audio_dataset, events, min_margin_db=3.0,
                       for a in audio_dataset}
         levels = correct_channel_levels(raw_levels, recording_bias_db)
         ranked, margin = rank_levels(levels)
-        accepted = bool(len(ranked) >= 2 and margin >= min_margin_db)
+        accepted = bool(len(ranked) >= 2 and
+                        np.isfinite(margin) and margin >= min_margin_db)
         channel = ranked[0][0] if accepted else None
-        reason = "largest calibrated relative level" if accepted else "ambiguous/invalid"
+        # 리포트/CSV에 실제 dB 비교값과 기각 이유를 남겨 threshold 문제인지
+        # 시간·주파수 창에서 유효한 STFT가 없는 문제인지 구분할 수 있도록 한다.
+        if len(ranked) < 2:
+            reason = (
+                "unassigned: fewer than 2 valid channel levels; "
+                "check event timing, sampling rate, frequency limits, FFT length"
+            )
+        elif accepted:
+            reason = (
+                f"assigned {ranked[0][0]}: level gap={margin:.2f} dB "
+                f">= minimum {min_margin_db:.2f} dB"
+            )
+        else:
+            reason = (
+                f"unassigned: level gap={margin:.2f} dB "
+                f"< minimum {min_margin_db:.2f} dB"
+            )
         results.append(AssignmentResult(event, channel, margin, levels, reason))
     return results
 
@@ -133,7 +150,7 @@ def geometry_assignment(baseline_results, tracking_df, anchor_mapping,
 
 def run_assignment(audio_dataset, events, tracking_df=None, anchor_mapping=None,
                    geometry=None, sync=None, n_fft=1024, hop_length=256,
-                   min_ratio_margin_db=3.0):
+                   min_ratio_margin_db=0.03):
     """일관된 파이프라인: baseline -> (선택적) geometry 최종 판정."""
     bias = geometry.recording_bias_db if geometry is not None else None
     baseline = ratio_only_assignment(
@@ -230,8 +247,14 @@ def empirical_ratio_assignment(baseline_results, tracking_df, anchor_mapping,
             H = geometry.pixel_to_meter_h
             p_a = pixel_to_m(nose_a, H)
             p_b = pixel_to_m(nose_b, H)
-            u_a = p_a - pixel_to_m(nose_a - heading_a, H)
-            u_b = p_b - pixel_to_m(nose_b - heading_b, H)
+            # Distance-only uses only nose-nose distance. Transforming body
+            # orientation through H here previously made a nose-only dataset
+            # fail even though orientation does not enter ω_d.
+            if distance_only:
+                u_a = u_b = None
+            else:
+                u_a = p_a - pixel_to_m(nose_a - heading_a, H)
+                u_b = p_b - pixel_to_m(nose_b - heading_b, H)
             r_corr, weights = empirical_correct_ratio(
                 baseline.levels_db[channel_a], baseline.levels_db[channel_b],
                 p_a, p_b, u_a, u_b, empirical, distance_only
@@ -242,11 +265,18 @@ def empirical_ratio_assignment(baseline_results, tracking_df, anchor_mapping,
                                    mouse_id=None, reason="invalid geometry"))
             continue
         method = "distance-weight" if distance_only else "geometry-weight"
+        weighting = (
+            f"distance={weights['distance_m']:.4f}m; "
+            f"omega_d={weights['omega_d']:.3f}"
+            if distance_only else
+            f"omega_d={weights['omega_d']:.3f}; "
+            f"omega_theta={weights['omega_theta']:.3f}; "
+            f"omega_geo={weights['omega_geo']:.3f}"
+        )
         results.append(replace(
             baseline, method=method, mouse_id=mouse,
             reason=(f"R_corr={r_corr:+.4f} log-unit; "
-                    f"omega={weights['omega_geo']:.3f}; "
-                    f"omega_safe={weights['omega_safe']:.3f}; "
+                    f"{weighting}; omega_safe={weights['omega_safe']:.3f}; "
                     f"R_mid={threshold.r_mid:+.3f} MAD={threshold.mad:.3f}; "
                     f"{'assigned' if mouse else 'unassigned'}"),
             candidate_errors_db={**baseline.candidate_errors_db,
@@ -270,6 +300,10 @@ def run_empirical_assignment(audio_dataset, events, tracking_df, anchor_mapping,
         raise ValueError("Measured geometry and fitted threshold JSON required.")
     if tracking_df is None or anchor_mapping is None or sync is None:
         raise ValueError("Tracking, anchor IDs and synchronized start points required.")
+    # Explicit association is a scientific input, not inferred from track order.
+    # Reject old or stale mappings even when this function is called without GUI.
+    from video.track_anchor import validate_audio_video_mapping
+    validate_audio_video_mapping(anchor_mapping, channel_subjects)
     baseline = ratio_only_assignment(
         audio_dataset, events, n_fft=n_fft, hop_length=hop_length,
         recording_bias_db=geometry.recording_bias_db

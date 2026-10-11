@@ -73,7 +73,81 @@ class AudioData:
         raise TypeError(f"Unsupported WAV sample dtype: {raw.dtype}")
 
 
-def load_audio(path: str | Path, channel_id: str, csv_sr=None) -> AudioData:
+# Original-code find_header_row adapted for GUI:
+# Inspect a limited text preview rather than reading 5-minute sensor recordings.
+# The user confirms the header row and column mapping before parsing any CSV.
+import csv
+from itertools import islice
+
+
+def inspect_delimited_file(path, max_preview_rows=32):
+    """CSV/TXT 헤더 후보, 구분자, 텍스트 인코딩, 앞부분 행을 추정.
+
+    원본 Notion find_header_row처럼 '텍스트 헤더 + 다음 숫자 행'을 찾는다.
+    자동 추정값은 안내일 뿐이며 실제 열/단위는 Qt 대화상자에서 확인받는다.
+    """
+    path = Path(path)
+    detected_encoding, lines = None, None
+    for encoding in ("utf-8-sig", "cp949", "utf-16"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as handle:
+                sample = list(islice(handle, max_preview_rows))
+            if not sample or not any(line.strip() for line in sample):
+                raise ValueError("The CSV/TXT file is empty.")
+            detected_encoding, lines = encoding, sample
+            break
+        except UnicodeError:
+            continue
+    if lines is None:
+        raise UnicodeError(f"Cannot decode CSV/TXT header: {path.name}")
+    raw_text = "".join(lines)
+    try:
+        delimiter = csv.Sniffer().sniff(raw_text, delimiters=",;\t|").delimiter
+    except csv.Error:
+        delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+    # Keep physical line numbers: pandas.skiprows counts blank rows too.
+    rows = list(csv.reader(lines, delimiter=delimiter))
+
+    def numeric(value):
+        try:
+            float(str(value).strip())
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    header = 0
+    for i in range(len(rows)-1):
+        first, second = rows[i], rows[i+1]
+        if not first or not second or len(first) < 2 or len(first) != len(second):
+            continue
+        has_text = any(str(x).strip() and not numeric(x) for x in first)
+        populated = [x for x in second if str(x).strip()]
+        ratio = sum(numeric(x) for x in populated)/max(len(populated), 1)
+        if has_text and ratio >= .6:
+            header = i
+            break
+    return {
+        "encoding": detected_encoding,
+        "delimiter": delimiter,
+        "header_row": header,
+        "preview_rows": rows,
+        "preview_lines": lines,
+    }
+
+
+def read_delimited_table(path, table_spec=None):
+    """헤더 확인 정보로 pandas 테이블을 읽는다. skiprows는 0-based."""
+    spec = table_spec or {}
+    return pd.read_csv(
+        path,
+        sep=spec.get("delimiter", None),
+        engine="python",
+        encoding=spec.get("encoding", "utf-8-sig"),
+        skiprows=int(spec.get("header_row", 0)),
+    )
+
+
+def load_audio(path: str | Path, channel_id: str, csv_sr=None, csv_spec=None) -> AudioData:
     """WAV 또는 명시된 샘플레이트를 가진 단일 파형 CSV를 AudioData로 변환.
 
     CSV는 숫자 열 하나 또는 'amplitude'/'voltage' 열을 가진다고 가정한다.
@@ -88,15 +162,22 @@ def load_audio(path: str | Path, channel_id: str, csv_sr=None) -> AudioData:
     elif path.suffix.lower() == ".csv":
         if csv_sr is None or int(csv_sr) <= 0:
             raise ValueError("CSV waveform requires sampling rate (Hz).")
-        df = pd.read_csv(path)
-        if "amplitude" in df:
+        df = read_delimited_table(path, csv_spec)
+        # GUI에서 수동으로 선택한 파형 열을 우선한다.
+        column = (csv_spec or {}).get("amplitude_col")
+        if column is not None:
+            column = int(column)
+            if not 0 <= column < df.shape[1]:
+                raise ValueError("Selected audio amplitude column no longer exists.")
+            series = df.iloc[:, column]
+        elif "amplitude" in df:
             series = df["amplitude"]
         elif "voltage" in df:
             series = df["voltage"]
         elif df.shape[1] == 1:
             series = df.iloc[:, 0]
         else:
-            raise ValueError("CSV needs one waveform column, amplitude or voltage.")
+            raise ValueError("CSV needs a selected waveform amplitude/voltage column.")
         samples = pd.to_numeric(series, errors="raise").to_numpy(dtype=np.float32)
         sr = int(csv_sr)
     else:
@@ -108,7 +189,8 @@ def load_audio(path: str | Path, channel_id: str, csv_sr=None) -> AudioData:
     return AudioData(channel_id, path, int(sr), samples)
 
 
-def load_labels(path, onset="onset", offset="offset", unit="s") -> list[USVEvent]:
+def load_labels(path, onset="onset", offset="offset", unit="s",
+                table_spec=None, sr=None, hop_length=None) -> list[USVEvent]:
     """CSV/TXT 라벨의 onset/offset을 초(s) 단위 USVEvent로 통일.
 
     지원: onset/offset, start/end, onset_s/offset_s, Time Begin/Time End.
@@ -118,17 +200,43 @@ def load_labels(path, onset="onset", offset="offset", unit="s") -> list[USVEvent
     path = Path(path)
     if path.suffix.lower() not in (".csv", ".txt"):
         raise ValueError("Label file must be CSV or TXT.")
-    df = pd.read_csv(path, sep=None, engine="python")
+    df = read_delimited_table(path, table_spec)
+    # A valid header-only label file means this microphone detected zero USVs.
+    # It is still a required channel file and should not block other channels.
     names = {str(col).strip().lower().replace(" ", "_"): col for col in df.columns}
     options = [(onset, offset), ("onset_s", "offset_s"),
                ("start", "end"), ("time_begin", "time_end")]
-    selected = next(((names[a], names[b]) for a,b in options
-                     if a in names and b in names), None)
+    spec = table_spec or {}
+    if spec.get("onset_col") is not None and spec.get("offset_col") is not None:
+        on_idx, off_idx = int(spec["onset_col"]), int(spec["offset_col"])
+        if not (0 <= on_idx < df.shape[1] and 0 <= off_idx < df.shape[1]):
+            raise ValueError("Selected onset/offset header columns are out of range.")
+        if on_idx == off_idx:
+            raise ValueError("Onset and offset must use DIFFERENT CSV columns.")
+        selected = (df.columns[on_idx], df.columns[off_idx])
+    else:
+        selected = next(((names[a], names[b]) for a,b in options
+                         if a in names and b in names), None)
     if selected is None:
-        raise ValueError("Label header needs onset/offset (seconds) or start/end.")
-    if unit not in ("s", "ms"):
-        raise ValueError("Label units must be s or ms; automatic unit guessing is unsafe.")
-    multiplier = 0.001 if unit == "ms" else 1.0
+        raise ValueError("Confirm onset and offset header columns before analysis.")
+
+    unit = spec.get("time_unit", unit)
+    if unit in ("s", "seconds"):
+        multiplier = 1.0
+    elif unit in ("ms", "milliseconds"):
+        multiplier = 0.001
+    elif unit in ("samples", "stft_frames"):
+        if sr is None or int(sr) <= 0:
+            raise ValueError("Sample/frame labels require the corresponding WAV sample rate.")
+        if unit == "stft_frames":
+            source_hop = spec.get("label_hop_length", hop_length)
+            if source_hop is None or int(source_hop) <= 0:
+                raise ValueError("STFT-frame labels require the source hop_length.")
+            multiplier = float(source_hop) / int(sr)
+        else:
+            multiplier = 1.0 / int(sr)
+    else:
+        raise ValueError("Time unit must be s, ms, samples or stft_frames.")
     # 선택적 주파수 열: Avisoft 등에서 Hz 또는 kHz가 제공될 수 있다.
     # 파일 헤더에 명시한 주파수 단위만 해석하며 Hz/kHz를 추측하지 않는다.
     freq_options = [
@@ -138,8 +246,23 @@ def load_labels(path, onset="onset", offset="offset", unit="s") -> list[USVEvent
         ("fmin_khz", "fmax_khz", 1000.0),
         ("freq_min_khz", "freq_max_khz", 1000.0),
     ]
-    freq_columns = next(((names[a], names[b], scale)
-                         for a,b,scale in freq_options if a in names and b in names), None)
+    # If the GUI dialog provided a mapping, honor its optional (none) choice.
+    # Legacy imports without a review spec may still infer common column headers.
+    freq_columns = (
+        None if table_spec is not None else
+        next(((names[a], names[b], scale)
+              for a,b,scale in freq_options if a in names and b in names), None)
+    )
+    if spec.get("fmin_col") is not None and spec.get("fmax_col") is not None:
+        left, right = int(spec["fmin_col"]), int(spec["fmax_col"])
+        if not (0 <= left < df.shape[1] and 0 <= right < df.shape[1]):
+            raise ValueError("Selected frequency header columns are out of range.")
+        frequency_multiplier = 1000.0 if spec.get("frequency_unit") == "kHz" else 1.0
+        freq_columns = (df.columns[left], df.columns[right], frequency_multiplier)
+    elif spec.get("fmin_col") is not None or spec.get("fmax_col") is not None:
+        raise ValueError("Both frequency-bound columns must be selected together.")
+    if df.empty:
+        return []
     out = []
     for index, (a,b) in enumerate(zip(df[selected[0]], df[selected[1]])):
         if freq_columns is None:

@@ -70,7 +70,42 @@ def save_anchor_mapping(track_to_mouse: dict, mouse_to_channel: dict | None = No
         raise ValueError("Multiple tracks mapped to one mouse; review fragmentation.")
     mapping = {"track_to_mouse": dict(track_to_mouse)}
     if mouse_to_channel is not None:
-        if not set(track_to_mouse.values()).issubset(mouse_to_channel):
-            raise ValueError("Missing mouse-to-wearable-channel mappings.")
+        subjects = set(track_to_mouse.values())
+        if set(mouse_to_channel) != subjects:
+            raise ValueError("Each mapped video subject needs exactly one audio channel.")
+        channels = list(mouse_to_channel.values())
+        if (any(not str(cid).strip() for cid in channels)
+            or len(set(channels)) != len(channels)):
+            raise ValueError("Two mouse subjects cannot map to the same audio channel.")
         mapping["mouse_to_channel"] = dict(mouse_to_channel)
     return mapping
+
+
+def validate_audio_video_mapping(mapping: dict, channel_subjects: dict):
+    """Explicit 1-to-1 association for wearable/per-subject audio channels.
+
+    channel_subjects: {"ch1": "mouse_A", "ch2": "mouse_B"}
+    mapping: {"track_to_mouse": {"track_0": "mouse_B", ...},
+              "mouse_to_channel": {"mouse_A": "ch1", ...}}
+    Track IDs are SLEAP-generated labels, never inferred from audio file order.
+    This one-to-one mapping is NOT appropriate for a shared microphone array.
+    """
+    if not isinstance(mapping, dict):
+        raise ValueError("Review Audio ↔ Video track matching before analysis.")
+    expected = {subject: ch for ch, subject in channel_subjects.items()}
+    if len(expected) != len(channel_subjects):
+        raise ValueError("Audio Subject IDs must be unique.")
+    tracks = mapping.get("track_to_mouse") or {}
+    channels = mapping.get("mouse_to_channel") or {}
+    if not tracks or set(tracks.values()) != set(expected):
+        raise ValueError(
+            "Video tracks must map one-to-one to the current Audio Subject IDs."
+        )
+    if channels != expected:
+        raise ValueError(
+            "Audio ↔ Video association is missing or out of date. "
+            "Use 'Match Audio ↔ Video subjects' and confirm each channel/track."
+        )
+    if len(set(tracks.values())) != len(tracks):
+        raise ValueError("Video-to-mouse mapping contains duplicate Subject IDs.")
+    return True

@@ -16,9 +16,43 @@ QWidget#tab_audio, QWidget#tab_video,
 QWidget#tab_default_analyze, QWidget#tab_test_analyze,
 QWidget#scrollAreaWidgetContents, QWidget#scrollAreaWidgetContents_2,
 QWidget#scrollAreaWidgetContents_3, QWidget#scrollAreaWidgetContents_4,
-QWidget#soectrogram_container {
+QWidget#scrollAreaWidgetContents_5, QWidget#spectrogram_container,
+QWidget#scroll_content_default, QWidget#scroll_content_test {
     background-color: #1E1E1E;
     color: #F1F3F5;
+}
+
+/* Seamless audio work area: match main window, scroll viewport,
+   channel container, plotting surface and zero-signal LUT: #1E1E1E.
+   Keep only a faint 1px horizontal divider between channels. */
+QWidget#tab_audio,
+QWidget#scrollAreaWidgetContents,
+QWidget#spectrogram_container,
+QWidget#spectrogram_scroll_viewport,
+QWidget#spectrogram_channel_panel {
+    background-color: #1E1E1E;
+    color: #E8EDF1;
+}
+
+QScrollArea#scrollarea_spectrogram {
+    background-color: #1E1E1E;
+    border: none;
+    border-radius: 0px;
+}
+
+QWidget#spectrogram_channel_panel {
+    border: none;
+    border-bottom: 1px solid #35383B;
+    border-radius: 0px;
+}
+
+QLabel#spectrogram_channel_title {
+    color: #CBD4DA;
+    background-color: transparent;
+    border: none;
+    padding: 0px 2px;
+    font-size: 12px;
+    font-weight: 600;
 }
 
 QGroupBox {
@@ -26,8 +60,81 @@ QGroupBox {
     color: #F1F3F5;
     border: 1px solid #55585B;
     border-radius: 7px;
-    margin-top: 12px;
-    padding: 10px;
+    margin-top: 9px;
+    padding: 7px 9px;
+}
+
+/* Playback rows are QFrame, not QGroupBox:
+   no reserved title area, no top offset, all controls vertically centered.
+   40px total: button 28px, top/bottom layout margins 4px. */
+QFrame#playback_panel_audio,
+QFrame#playback_panel_4,
+QFrame#playback_panel_all {
+    background-color: #242424;
+    border: 1px solid #42474B;
+    border-radius: 6px;
+    margin: 0px;
+    padding: 0px;
+}
+
+/* 추가한 오디오 채널만 삭제하는 버튼: 차분한 붉은색 + 선명한 ASCII X. */
+QPushButton#btn_remove_audio_channel {
+    background-color: #38292D;
+    color: #D39DA3;
+    border: 1px solid #61434A;
+    border-radius: 5px;
+    padding: 0px;
+    min-height: 0px;
+    font-weight: 600;
+}
+QPushButton#btn_remove_audio_channel:hover {
+    background-color: #483135;
+    color: #F0C2C6;
+    border-color: #875D65;
+}
+QPushButton#btn_remove_audio_channel:pressed {
+    background-color: #55383F;
+    border-color: #9B6A72;
+}
+
+QPushButton#btn_starting_audio,
+QPushButton#btn_starting_video {
+    min-height: 0px;
+    padding: 2px 6px;
+    border-radius: 5px;
+}
+
+QPushButton#btn_audio_play,
+QPushButton#btn_video_play,
+QPushButton#btn_play_all {
+    background-color: #2D3336;
+    border: 1px solid #4B565C;
+    color: #E4F9FC;
+    border-radius: 5px;
+    padding: 0px;
+    min-height: 0px;
+    font-size: 15px;
+}
+QPushButton#btn_audio_play:hover,
+QPushButton#btn_video_play:hover,
+QPushButton#btn_play_all:hover {
+    background-color: #30525C;
+    border-color: #40C9DF;
+}
+QPushButton#btn_audio_play:disabled,
+QPushButton#btn_video_play:disabled,
+QPushButton#btn_play_all:disabled {
+    color: #7C858A;
+    background-color: #292929;
+    border-color: #393D40;
+}
+QComboBox#audio_playback_channel {
+    background-color: #2D2D2D;
+    color: #D4E1E6;
+    border: 1px solid #474E53;
+    border-radius: 5px;
+    padding: 1px 2px 1px 4px;
+    min-height: 0px;
 }
 
 QGroupBox::title {
@@ -37,6 +144,37 @@ QGroupBox::title {
     padding: 0px 5px;
     color: #F1F3F5;
     background-color: #252525;
+}
+
+/* Default Analyzing: data / STFT / Sync / display / geometry / validation.
+   Actual widgets stay functional; only their visual grouping changes. */
+QGroupBox#settings_group_files,
+QGroupBox#settings_group_stft,
+QGroupBox#settings_group_sync,
+QGroupBox#settings_group_display,
+QGroupBox#settings_group_geometry,
+QGroupBox#settings_group_validation {
+    background-color: #262626;
+    color: #E5EAF0;
+    border: 1px solid #42474B;
+    border-radius: 6px;
+    margin-top: 12px;
+    padding: 2px 4px 4px 4px;
+}
+
+QGroupBox#settings_group_files::title,
+QGroupBox#settings_group_stft::title,
+QGroupBox#settings_group_sync::title,
+QGroupBox#settings_group_display::title,
+QGroupBox#settings_group_geometry::title,
+QGroupBox#settings_group_validation::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0px 6px;
+    color: #A8CCD8;
+    background-color: #262626;
+    font-weight: 600;
 }
 
 QLabel {
@@ -49,8 +187,8 @@ QPushButton {
     color: #F1F3F5;
     border: 1px solid #3C4044;
     border-radius: 6px;
-    padding: 6px 12px;
-    min-height: 20px;
+    padding: 5px 10px;
+    min-height: 18px;
 }
 
 QPushButton:hover {
@@ -175,9 +313,15 @@ QSlider::handle:horizontal {
     margin: -8px 0;
 }
 
+/* Splitter 클릭 영역을 9px로 넓혀서 가로/세로 모두 드래그 가능. */
 QSplitter::handle {
-    background-color: #373C40;
-    width: 4px;
+    background-color: #353D43;
+}
+QSplitter::handle:horizontal {
+    width: 9px;
+}
+QSplitter::handle:vertical {
+    height: 9px;
 }
 QSplitter::handle:hover {
     background-color: #40C9DF;

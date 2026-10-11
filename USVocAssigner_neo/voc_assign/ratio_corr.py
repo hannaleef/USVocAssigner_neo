@@ -174,6 +174,30 @@ def ellipse_ray_length(theta, config: EmpiricalGeoConfig):
     return float(max(0., (2*a*b*b*ct)/denom))
 
 
+def empirical_distance_weights(p_a, p_b, config: EmpiricalGeoConfig):
+    """Distance-only: 위치 벡터 두 개만으로 ω_d를 계산한다.
+
+    ω_d = 1 - exp[-d/(βW)], d=||p_B-p_A|| (단위 m).
+    torso/heading/θ/ellipse는 이 모드에서 필요하지 않다.
+    기존 geometry_weight_mode(product/complement)는 거리-only 식에 영향을 주지 않음.
+    """
+    pa, pb = np.asarray(p_a, float), np.asarray(p_b, float)
+    if (pa.shape != (2,) or pb.shape != (2,)
+        or not np.isfinite(pa).all() or not np.isfinite(pb).all()):
+        raise ValueError("Distance correction needs valid 2D metric nose points.")
+    d = float(np.linalg.norm(pb - pa))
+    if d <= 1e-12:
+        raise ValueError("Two mouse noses coincide; distance weighting undefined.")
+    omega_d = float(-np.expm1(-d/(config.beta * config.body_width_m)))
+    return {
+        "distance_m": d, "theta_a_rad": float("nan"),
+        "theta_b_rad": float("nan"), "l_m": float("nan"),
+        "omega_d": omega_d, "omega_theta": 1.0,
+        "omega_geo": omega_d,
+        "omega_safe": max(omega_d, config.omega_min),
+    }
+
+
 def empirical_geometry_weights(p_a, p_b, u_a, u_b,
                                config: EmpiricalGeoConfig):
     """두 nose 좌표(m), 전방 단위방향 벡터로 거리/타원/최종 가중치 계산.
@@ -216,13 +240,16 @@ def empirical_correct_ratio(level_a_db, level_b_db, p_a_m, p_b_m,
     R_amp = ln(A_amp/B_amp) = ln(10)/20 * (L_A_dB - L_B_dB).
     두 채널의 감도/증폭도 보정을 마친 값이어야 한다.
     """
-    weights = empirical_geometry_weights(p_a_m, p_b_m, u_a_m, u_b_m, config)
+    # Distance-only MUST NOT invoke the angle/torsion/ellipse branch.
+    weights = (
+        empirical_distance_weights(p_a_m, p_b_m, config)
+        if distance_only
+        else empirical_geometry_weights(p_a_m, p_b_m, u_a_m, u_b_m, config)
+    )
     amp_log_ratio = (float(level_a_db) - float(level_b_db))*np.log(10)/20
     if not np.isfinite(amp_log_ratio):
         raise ValueError("Channel amplitude levels must be finite.")
-    reliability = (max(weights["omega_d"], config.omega_min)
-                   if distance_only else weights["omega_safe"])
-    return float(amp_log_ratio / reliability), weights
+    return float(amp_log_ratio / weights["omega_safe"]), weights
 
 
 def empirical_decision(r_corr, threshold: EmpiricalThreshold, id_a, id_b):
