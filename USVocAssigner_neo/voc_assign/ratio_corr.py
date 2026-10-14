@@ -132,23 +132,52 @@ class EmpiricalGeoConfig:
 
 @_dataclass(frozen=True)
 class EmpiricalThreshold:
-    """학습/검증 데이터에서 얻은 경계. 여기의 MAD는 unscaled raw MAD."""
+    """Decision boundary for corrected *natural-log* amplitude ratio.
+
+    Manual mode (default in GUI): midpoint=0, an absolute user-selected
+    half-width; training data are not required. Legacy fit mode is kept only
+    for backward compatibility with earlier research scripts.
+    """
     r_mid: float
     mad: float
     k: float = 1.0
+    manual_margin: float | None = None
 
     def __post_init__(self):
         if not np.isfinite(self.r_mid) or not np.isfinite(self.mad):
-            raise ValueError("Finite median and MAD required.")
-        if self.mad < 0 or self.k <= 0:
-            raise ValueError("MAD >= 0 and k > 0 required.")
+            raise ValueError("Finite midpoint and legacy MAD required.")
+        if self.mad < 0 or not np.isfinite(self.k) or self.k <= 0:
+            raise ValueError("MAD >= 0 and finite k > 0 required.")
+        if self.manual_margin is not None:
+            if (not np.isfinite(self.manual_margin)
+                    or self.manual_margin < 0):
+                raise ValueError("Manual log-ratio threshold must be finite and >= 0.")
+            if self.r_mid != 0.0:
+                raise ValueError("Manual threshold requires a midpoint of zero.")
+
+    @property
+    def half_width(self):
+        if self.manual_margin is not None:
+            return float(self.manual_margin)
+        return float(self.k * self.mad)
+
+
+def manual_empirical_threshold(log_ratio_margin=0.5):
+    """Return zero-centered manual |R_corr| boundary without any dataset.
+
+    R_corr = ln(A_amp/B_amp) / omega_safe, NOT the linear ratio A_amp/B_amp.
+    A when R_corr > +margin, B when R_corr < -margin, otherwise unassigned.
+    """
+    return EmpiricalThreshold(
+        r_mid=0.0, mad=0.0, k=1.0,
+        manual_margin=float(log_ratio_margin),
+    )
 
 
 def fit_empirical_threshold(training_r_corr, k=1.0):
-    """미리 정의한 TRAINING 분할에서만 경계 학습; 평가 세트 사용 금지.
+    """Optional legacy median/MAD fitting, not required by the GUI.
 
-    실제 A/B 정답 라벨이 없는 median/MAD만으로는 정확도를 증명할 수 없다.
-    클래스 불균형과 0 MAD에 주의. 임계값은 별도 validation으로 튜닝한다.
+    Do not fit on the same ground-truth examples used for evaluation.
     """
     arr = np.asarray(training_r_corr, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -157,7 +186,7 @@ def fit_empirical_threshold(training_r_corr, k=1.0):
     mid = float(np.median(arr))
     mad = float(np.median(np.abs(arr - mid)))
     if mad == 0:
-        raise ValueError("MAD=0; validation labels/more diverse training data required.")
+        raise ValueError("MAD=0; fit requires more variable training data.")
     return EmpiricalThreshold(mid, mad, float(k))
 
 
@@ -253,9 +282,13 @@ def empirical_correct_ratio(level_a_db, level_b_db, p_a_m, p_b_m,
 
 
 def empirical_decision(r_corr, threshold: EmpiricalThreshold, id_a, id_b):
-    """중앙값±k×MAD 기준 A/B 또는 unassigned 반환(경계 자체는 미할당)."""
-    high = threshold.r_mid + threshold.k*threshold.mad
-    low = threshold.r_mid - threshold.k*threshold.mad
+    """Use a fixed zero center with a manually entered log-ratio half-width.
+
+    The legacy fitted threshold is also supported by the same class; equality
+    at either boundary is conservatively unassigned.
+    """
+    high = threshold.r_mid + threshold.half_width
+    low = threshold.r_mid - threshold.half_width
     if not np.isfinite(r_corr):
         return None
     if r_corr > high:

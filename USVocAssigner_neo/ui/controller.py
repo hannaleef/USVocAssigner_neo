@@ -1,4 +1,6 @@
 # [ui/controller.py] 5단계 통합 GUI
+# SOURCE_VERSION: 2026-10-14_RATIO_ONLY_DB_THRESHOLD_EDITABLE
+# 최신본: LastSpectrogramResizeGrip / QProgressBar DLC ETA / ratio-only 0.1 dB
 # 1) N채널 WAV 입력 -> Ratio-only 분석
 # 2) 채널별 스펙트로그램 + QMediaPlayer 영상 재생
 # 3) SLEAP CSV 로드 -> 추적 ID 확인(Anchor) -> 오디오/비디오 offset
@@ -7,6 +9,7 @@
 #
 # 기존 Qt Designer의 Ui_MainWindow, tab_audio, tab_video 및 objectName 재사용.
 # ui_mainwindow.py는 직접 변경하지 않는다.
+# 이 파일은 단독 실행 진입점이 아니다. executor/main.py 또는 python -m executor.main 사용.
 # GUI에서 실행되는 계산량 큰 STFT·할당은 Qt thread pool에서 처리한다.
 # Audio-only: 원본 1초=실제 재생 1초. 48kHz polyphase resampling으로 길이 보존.
 # 초음파용 heterodyne은 주파수만 가청 대역으로 이동하며 시간축/분석 WAV는 보존.
@@ -17,6 +20,9 @@ import csv
 import json
 import tempfile
 import wave
+import threading
+import time
+from bisect import bisect_left, bisect_right
 from math import gcd
 from pathlib import Path
 
@@ -25,15 +31,15 @@ from scipy.signal import resample_poly
 import pandas as pd
 import pyqtgraph as pg
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QEvent
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QEvent, QPointF
 from PySide6.QtCore import QSignalBlocker, QUrl, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QPdfWriter, QPageSize, QFont
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QInputDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
-    QSizePolicy, QFrame, QGroupBox, QLayout, QTableWidget,
+    QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QProgressDialog, QProgressBar, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QSizePolicy, QFrame, QGroupBox, QLayout, QTableWidget, QSplitter,
     QTableWidgetItem, QAbstractItemView, QStyle, QStyleOptionSlider
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -44,14 +50,20 @@ from audio.data_load import (
     load_audio, load_labels, inspect_delimited_file, read_delimited_table
 )
 from audio.voc_label import merge_channel_events
-from audio.aud_process import window_spectrogram
+from audio.aud_process import (
+    window_spectrogram, load_frequency_response_csv,
+    calibration_band_level_db
+)
 from video.track_data import process_tracking_data
 from video.track_anchor import (
     select_anchor_frame, draw_anchor_frame, save_anchor_mapping,
     validate_audio_video_mapping
 )
 from voc_assign.aud_vid_sync import SyncConfig, sync_from_start_points
-from voc_assign.ratio_corr import GeometryConfig, EmpiricalGeoConfig, EmpiricalThreshold
+from voc_assign.ratio_corr import (
+    GeometryConfig, EmpiricalGeoConfig, EmpiricalThreshold,
+    manual_empirical_threshold,
+)
 from voc_assign.voc_assign import run_assignment, run_empirical_assignment
 from executor.result_viewer import format_results, export_results_csv, result_records
 
@@ -176,6 +188,31 @@ class WorkerSignals(QObject):
     finished = Signal(int, object, str)
 
 
+class ExportSignals(QObject):
+    """Export is off the GUI thread; progress and completion are Qt signals."""
+    progress = Signal(int)
+    finished = Signal(object, str)
+
+
+class ExportJob(QRunnable):
+    def __init__(self, function, args, cancel_event):
+        super().__init__()
+        self.function = function
+        self.args = args
+        self.cancel_event = cancel_event
+        self.signals = ExportSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            output = self.function(
+                *self.args, self.cancel_event, self.signals.progress.emit
+            )
+            self.signals.finished.emit(output, "")
+        except Exception as exc:
+            self.signals.finished.emit(None, str(exc))
+
+
 class ComputeJob(QRunnable):
     """result = function(*args) 계산; 예외는 문자열 형태로 UI에 전달."""
 
@@ -210,20 +247,50 @@ def _json_safe(value):
     return value
 
 
-def compute_spectrograms(audio_slots, start_s, width_s, n_fft, hop_length):
-    """스레드에서 모든 채널의 동일 시간 구간을 처리."""
+# Spectrogram axes are common to all microphone channels; actual measured
+# frequencies are capped separately at each WAV's Nyquist limit.
+SPECTROGRAM_FREQ_MAX_HZ = 150_000.0
+
+
+def compute_spectrograms(
+    audio_slots, start_s, width_s, n_fft, hop_length,
+    fmin_hz=0.0, fmax_hz=150000.0, display_window_ms=4.096
+):
+    """STFT for display only; quantitative assignment remains unchanged.
+
+    Real frequency resolution is improved by the 4.096-ms Hann window
+    (1024 samples at 250 kS/s => ~244.1-Hz unpadded FFT bin spacing).
+    User can adjust display_window_ms to trade frequency vs time detail.
+    Zero-padding increases the plotted FFT grid density, not true resolution.
+    Each call computes only the visible time/frequency interval.
+    """
+    if not (0.0 <= fmin_hz < fmax_hz):
+        raise ValueError("Frequency max must be greater than min.")
+    if not 0.5 <= display_window_ms <= 20.0:
+        raise ValueError("Display STFT window must be 0.5–20 ms.")
+    detail_mode = width_s <= 0.150
     result = []
     for audio in audio_slots:
         if audio is None:
             result.append(None)
             continue
-        data = window_spectrogram(
-            audio, start_s, width_s,
-            n_fft=n_fft, hop_length=hop_length,
-            fmin=18000, fmax=min(100000, audio.sr / 2),
-            max_time_bins=1200
+
+        # This is independent of the analysis spin_n_fft used by event_level.
+        display_window = max(16, round(audio.sr * display_window_ms / 1000.0))
+        display_hop = (
+            max(1, int(hop_length)) if detail_mode
+            else max(int(hop_length), round(audio.sr * 0.0005))
         )
-        result.append(data)
+        display_hop = min(display_hop, display_window)
+        display_fft = max(display_window, 4096 if detail_mode else 2048)
+
+        result.append(window_spectrogram(
+            audio, start_s, width_s,
+            n_fft=display_window, hop_length=display_hop,
+            fmin=fmin_hz, fmax=min(fmax_hz, audio.sr / 2.0),
+            fft_points=display_fft, max_time_bins=None,
+            include_edge_context=True,
+        ))
     return result
 
 
@@ -517,23 +584,547 @@ class CSVHeaderDialog(QDialog):
         super().accept()
 
 
+def export_combined_mp4(path, video_path, audio_slots, labels, assignments,
+                        offset_s, video_fps, video_duration, duration_s,
+                        span_s, fmin, fmax, win_ms, hop, lut, levels,
+                        fps, cancelled, progress):
+    """Write the *entire audio duration* as a silent synchronized MP4.
+
+    Work in short STFT tiles and stream frames to disk. A video gap stays
+    visibly empty; it does not truncate the WAV's original time axis.
+    """
+    import cv2
+    import os
+    from bisect import bisect_left, bisect_right
+    if not 0 < duration_s <= 5400.0001:
+        raise ValueError("Audio must be <=90 minutes.")
+    if not 0 < span_s <= 10 or not 0 < fps <= 60:
+        raise ValueError("Invalid span/FPS for export.")
+    if video_fps is None or video_fps <= 0:
+        raise ValueError("Valid video FPS is required.")
+    if any(a is None for a in audio_slots):
+        raise ValueError("Every audio channel must be loaded.")
+    colors = np.asarray(lut, dtype=np.uint8)[:, :3][:, ::-1]
+    lowdb, highdb = levels
+    W = 1280
+    H = (max(720, 115+158*len(audio_slots))+1)//2*2
+    VX, GX, GW = 625, 680, 580
+    GH = max(110, (H-125)//len(audio_slots)-8)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Cannot decode source video.")
+    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, -offset_s)*1000.0)
+    read_idx = int(round(max(0.0, -offset_s)*video_fps))
+    cached_idx, cached_frame = -1, None
+    partial = str(Path(path).with_name(Path(path).stem+"._partial.mp4"))
+    out = cv2.VideoWriter(partial, cv2.VideoWriter_fourcc(*"mp4v"),
+                          float(fps), (W, H))
+    if not out.isOpened():
+        cap.release()
+        raise RuntimeError("MP4 encoder could not open.")
+    # Pre-index markers so long exports avoid scanning every USV per tile.
+    label_index = []
+    for channel_events in labels:
+        events = sorted(channel_events, key=lambda e: e[0])
+        starts = [e[0] for e in events]
+        max_ends = []
+        last_end = float("-inf")
+        for onset, offset in events:
+            last_end = max(last_end, offset)
+            max_ends.append(last_end)
+        label_index.append((events, starts, max_ends))
+    assignments = sorted(assignments, key=lambda e: e[0])
+    assignment_starts = [e[0] for e in assignments]
+    assignment_max_ends = []
+    last_end = float("-inf")
+    for onset, offset, _ in assignments:
+        last_end = max(last_end, offset)
+        assignment_max_ends.append(last_end)
+    tile_index = -1
+    prepared = None
+    last = max(1, int(np.ceil(duration_s*fps)))
+    completed = False
+    try:
+        for i in range(last):
+            if cancelled.is_set():
+                raise RuntimeError("MP4 export canceled")
+            time_s = min(duration_s, i/float(fps))
+            tile = int(time_s/span_s)
+            start_s, end_s = tile*span_s, min(duration_s,(tile+1)*span_s)
+            if tile != tile_index:
+                tile_index = tile
+                prepared = np.full((H,W,3),(31,29,27),dtype=np.uint8)
+                cv2.putText(prepared,"USVocAssigner | FULL AUDIO",
+                            (18,34),cv2.FONT_HERSHEY_SIMPLEX,.8,
+                            (235,235,235),2,cv2.LINE_AA)
+                cv2.putText(prepared,"VIDEO",(20,65),
+                            cv2.FONT_HERSHEY_SIMPLEX,.55,(230,230,230),1)
+                for ch,a in enumerate(audio_slots):
+                    top = 97+ch*(GH+8)
+                    bottom = top+GH-5
+                    if bottom >= H-28:
+                        continue
+                    cv2.putText(prepared,f"CH {ch+1} {a.path.name}"[:55],
+                                (GX,top-3),cv2.FONT_HERSHEY_SIMPLEX,
+                                .40,(225,225,225),1,cv2.LINE_AA)
+                    result = compute_spectrograms(
+                        (a,), start_s, max(.005,end_s-start_s), 512, hop,
+                        fmin_hz=fmin, fmax_hz=fmax,
+                        display_window_ms=win_ms)
+                    if result and result[0] is not None and result[0][0].size:
+                        db = result[0][0]
+                        ci = np.clip((db-lowdb)/(highdb-lowdb),0,1)
+                        ci = (ci*(len(colors)-1)).astype(np.uint16)
+                        colored = colors[ci][::-1,:,:]
+                        prepared[top:bottom,GX:GX+GW] = cv2.resize(
+                            colored, (GW,bottom-top),
+                            interpolation=cv2.INTER_LINEAR)
+                    events, starts, max_ends = label_index[ch]
+                    first = bisect_left(max_ends, start_s)
+                    last_i = bisect_right(starts, end_s)
+                    for onset,offset in events[first:last_i]:
+                        if offset < start_s: continue
+                        for t,color in ((onset,(136,238,184)),
+                                        (offset,(178,134,255))):
+                            if start_s <= t <= end_s:
+                                x = GX+round((t-start_s)/span_s*GW)
+                                cv2.line(prepared,(x,top),(x,bottom),color,
+                                         1,cv2.LINE_AA)
+                    first_a = bisect_left(
+                        assignment_max_ends, start_s
+                    )
+                    last_a = bisect_right(assignment_starts, end_s)
+                    for onset,offset,mouse in assignments[first_a:last_a]:
+                        if offset<start_s: continue
+                        center=(onset+offset)/2
+                        if start_s<=center<=end_s:
+                            x=GX+round((center-start_s)/span_s*GW)
+                            cv2.putText(prepared,str(mouse)[:12],
+                                        (max(GX,x-15),top+14),
+                                        cv2.FONT_HERSHEY_SIMPLEX,.40,
+                                        (240,240,240),1,cv2.LINE_AA)
+                cv2.putText(prepared,f"Window {start_s:.3f}-{end_s:.3f} s",
+                            (GX,H-12),cv2.FONT_HERSHEY_SIMPLEX,.48,
+                            (220,220,220),1,cv2.LINE_AA)
+            frame = prepared.copy()
+            video_t = time_s-offset_s
+            if 0 <= video_t < video_duration:
+                target = int(round(video_t*video_fps))
+                if target >= read_idx:
+                    while read_idx < target:
+                        if not cap.grab(): break
+                        read_idx += 1
+                    ok, decoded = cap.read()
+                    if ok:
+                        cached_frame,cached_idx = decoded,target
+                        read_idx = target+1
+                if cached_frame is not None:
+                    vh,vw = cached_frame.shape[:2]
+                    factor = min((VX-30)/vw,(H-130)/vh)
+                    ow,oh = int(round(vw*factor)),int(round(vh*factor))
+                    scaled = cv2.resize(cached_frame,(ow,oh))
+                    x0,y0 = 15+(VX-30-ow)//2,95+(H-130-oh)//2
+                    frame[y0:y0+oh,x0:x0+ow] = scaled
+            else:
+                cv2.putText(frame,"NO CORRESPONDING VIDEO",
+                            (35,H//2),cv2.FONT_HERSHEY_SIMPLEX,.67,
+                            (190,190,240),2,cv2.LINE_AA)
+            xc = GX+round(((time_s-start_s)/span_s)*GW)
+            for ch in range(len(audio_slots)):
+                top = 97+ch*(GH+8)
+                bottom = min(H-28,top+GH-5)
+                if bottom > top:
+                    cv2.line(frame,(xc,top),(xc,bottom),
+                             (92,184,255),2,cv2.LINE_AA)
+            cv2.putText(frame,f"Audio {time_s:.3f}/{duration_s:.3f}s | "
+                        f"Video {video_t:.3f}s",(20,H-12),
+                        cv2.FONT_HERSHEY_SIMPLEX,.45,
+                        (220,220,220),1,cv2.LINE_AA)
+            out.write(frame)
+            if i%max(1,int(fps)*3)==0:
+                progress(min(99,int(100*(i+1)/last)))
+        completed = True
+    finally:
+        out.release()
+        cap.release()
+        if not completed:
+            Path(partial).unlink(missing_ok=True)
+    os.replace(partial,str(path))
+    progress(100)
+    return str(path)
+
+
+class AllMediaWindow(QWidget):
+    """Separate live video+spectrogram viewer sharing one playback clock."""
+
+    def __init__(self, main_window):
+        super().__init__(main_window, Qt.WindowType.Window)
+        self.main_window = main_window
+        self.setWindowTitle("USVocAssigner | All Media")
+        self.setObjectName("all_media_window")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.resize(1460, 850)
+        self.setMinimumSize(860, 470)
+        self.views = []
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("▶ Play All", self)
+        self.play_button.clicked.connect(main_window.toggle_video)
+        controls.addWidget(self.play_button)
+        self.slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.slider.sliderMoved.connect(main_window.player.setPosition)
+        controls.addWidget(self.slider, 1)
+        self.clock_label = QLabel("", self)
+        controls.addWidget(self.clock_label)
+        root.addLayout(controls)
+        self.sync_label = QLabel("", self)
+        self.sync_label.setWordWrap(True)
+        root.addWidget(self.sync_label)
+
+        layout_split = QSplitter(Qt.Orientation.Horizontal, self)
+        layout_split.setHandleWidth(10)
+        layout_split.setChildrenCollapsible(False)
+        root.addWidget(layout_split, 1)
+        video_panel = QWidget(layout_split)
+        left = QVBoxLayout(video_panel)
+        left.addWidget(QLabel("Video | shared clock"))
+        self.video_widget = QVideoWidget(video_panel)
+        self.video_widget.setMinimumWidth(290)
+        left.addWidget(self.video_widget, 1)
+        layout_split.addWidget(video_panel)
+
+        audio_panel = QWidget(layout_split)
+        right = QVBoxLayout(audio_panel)
+        right.addWidget(QLabel(
+            "Spectrograms | all channels | onset: green | offset: pink"
+        ))
+        self.spec_scroll = QScrollArea(audio_panel)
+        self.spec_scroll.setWidgetResizable(True)
+        right.addWidget(self.spec_scroll, 1)
+        layout_split.addWidget(audio_panel)
+        layout_split.setSizes([700, 760])
+
+        # Mirror decoded frames; do not create a second QMediaPlayer.
+        main_window.video_widget.videoSink().videoFrameChanged.connect(
+            self._receive_video_frame
+        )
+        # A window opened while paused may never receive videoFrameChanged
+        # until playback resumes; copy the current decoded frame immediately.
+        current_frame = main_window.video_widget.videoSink().videoFrame()
+        if current_frame.isValid():
+            self._receive_video_frame(current_frame)
+        self.rebuild_channels()
+        self.sync_from_main()
+
+    def _receive_video_frame(self, frame):
+        try:
+            self.video_widget.videoSink().setVideoFrame(frame)
+        except RuntimeError:
+            pass
+
+    def rebuild_channels(self):
+        main = self.main_window
+        self.views = []
+        host = QWidget(self.spec_scroll)
+        holder = QVBoxLayout(host)
+        holder.setContentsMargins(2, 2, 2, 2)
+        splitter = QSplitter(Qt.Orientation.Vertical, host)
+        splitter.setHandleWidth(11)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStyleSheet(
+            "QSplitter::handle:vertical {background:#35505C;"
+            "border-top:1px solid #638190;}"
+            "QSplitter::handle:vertical:hover {background:#4AA8C2;}"
+        )
+        holder.addWidget(splitter, 1)
+        self.channel_splitter = splitter
+        host.setMinimumHeight(max(280, len(main.audio_slots)*270))
+        for index, audio in enumerate(main.audio_slots):
+            panel = QWidget(splitter)
+            panel.setMinimumHeight(160)
+            panel_layout = QVBoxLayout(panel)
+            panel_layout.setContentsMargins(3, 3, 3, 3)
+            title = "CH {} | {}".format(
+                index+1, audio.path.name if audio and audio.path else "No WAV"
+            )
+            panel_layout.addWidget(QLabel(title))
+            plot = pg.PlotWidget(panel)
+            plot.setMinimumHeight(135)
+            plot.setBackground(SPECTROGRAM_BG)
+            plot.setLabel("bottom", "Time", units="s")
+            plot.setLabel("left", "Frequency", units="Hz")
+            plot.setMouseEnabled(x=False, y=False)
+            image = pg.ImageItem(axisOrder="col-major")
+            image.setLookupTable(main.spectrogram_lut)
+            plot.addItem(image)
+            cursor = pg.InfiniteLine(
+                angle=90, pen=pg.mkPen(SPECTROGRAM_PLAYHEAD, width=1.8),
+                movable=False
+            )
+            cursor.setZValue(90)
+            plot.addItem(cursor)
+            panel_layout.addWidget(plot, 1)
+            splitter.addWidget(panel)
+            self.views.append({
+                "plot": plot, "image": image, "cursor": cursor, "items": []
+            })
+        self.spec_scroll.setWidget(host)
+        if self.views:
+            QTimer.singleShot(
+                0, lambda current=splitter, n=len(self.views):
+                    current.setSizes([270] * n)
+                    if self.isVisible() and self.channel_splitter is current
+                    else None
+            )
+
+    def refresh_cursor(self):
+        main = self.main_window
+        video_ms = int(main.player.position())
+        with QSignalBlocker(self.slider):
+            self.slider.setRange(0, max(0, main.video_duration_ms))
+            self.slider.setValue(video_ms)
+        self.clock_label.setText(
+            f"{main._format_ms(video_ms)} / "
+            f"{main._format_ms(main.video_duration_ms)}"
+        )
+        running = main.player.playbackState() == (
+            QMediaPlayer.PlaybackState.PlayingState
+        )
+        self.play_button.setText(
+            "❚❚ Pause All" if running and main._play_all_active else "▶ Play All"
+        )
+        self.sync_label.setText(
+            f"Sync offset (Audio − Video): {main.sync.offset_s:+.3f} s"
+            if main._sync_is_ready()
+            else "Audio/Video sync not set. Mark matching onset times to "
+                 "make the spectrogram follow video playback."
+        )
+        for entry in self.views:
+            entry["cursor"].setValue(main._audio_cursor_ms / 1000)
+            entry["cursor"].setVisible(
+                main.ui.slider_timeline_audio.maximum() > 0
+            )
+
+    def sync_from_main(self):
+        """Reuse the main plots' STFT grids and display annotations."""
+        main = self.main_window
+        self.refresh_cursor()
+        start, stop = main._render_request_bounds
+        for index, view in enumerate(self.views):
+            plot, image = view["plot"], view["image"]
+            if (index >= len(main.audio_slots)
+                or main.audio_slots[index] is None):
+                # Channel deletion/replacement can temporarily leave the
+                # secondary viewer one event-loop iteration behind the main
+                # channel list. Clear instead of indexing an old WAV slot.
+                image.clear()
+                continue
+            data = (
+                main._spectrogram_render_data[index]
+                if index < len(main._spectrogram_render_data) else None
+            )
+            if data is not None and len(data) == 3 and data[0].size:
+                db, times, freqs = data
+                image.setImage(
+                    db.T, autoLevels=False, levels=main.spectrogram_levels_db
+                )
+                sr = main.audio_slots[index].sr
+                dt = float(times[1]-times[0]) if len(times)>1 else 1.0/sr
+                df = float(freqs[1]-freqs[0]) if len(freqs)>1 else 1.0
+                image.setRect(QRectF(
+                    float(times[0]-dt/2), float(freqs[0]-df/2),
+                    float(len(times)*dt), float(len(freqs)*df)
+                ))
+            else:
+                image.clear()
+            if index < len(main.spectrogram_views):
+                y0, y1 = main.spectrogram_views[index][0].viewRange()[1]
+            else:
+                y0 = main.spec_freq_min_spin.value() * 1000.0
+                y1 = main.spec_freq_max_spin.value() * 1000.0
+            plot.setXRange(float(start), float(stop), padding=0)
+            plot.setYRange(float(y0), float(y1), padding=0)
+            for item in view["items"]:
+                plot.removeItem(item)
+            view["items"] = []
+
+            if index < len(main._label_boundary_index):
+                intervals, starts, prefix_ends = main._label_boundary_index[index]
+                low = bisect_left(prefix_ends, start)
+                high = bisect_right(starts, stop)
+                for onset_s, offset_s in intervals[low:high]:
+                    for x, pen in (
+                        (onset_s, pg.mkPen("#B8EE88", width=1.5)),
+                        (offset_s, pg.mkPen(
+                            "#FF86B2", width=1.5,
+                            style=Qt.PenStyle.DashLine
+                        )),
+                    ):
+                        if start <= x <= stop:
+                            line = pg.InfiniteLine(
+                                pos=x, angle=90, pen=pen, movable=False
+                            )
+                            line.setZValue(35)
+                            line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                            plot.addItem(line, ignoreBounds=True)
+                            view["items"].append(line)
+
+            if index < len(main.spectrogram_views):
+                original_plot = main.spectrogram_views[index][0]
+                for source_plot, source_label in main.overlay_items:
+                    if source_plot is not original_plot:
+                        continue
+                    label = pg.TextItem(
+                        text=source_label.textItem.toPlainText(),
+                        color="#FFFADC", anchor=(0.5, 1),
+                        fill=pg.mkBrush(18, 30, 39, 230)
+                    )
+                    label.setZValue(150)
+                    label.setPos(source_label.pos())
+                    plot.addItem(label, ignoreBounds=True)
+                    view["items"].append(label)
+
+    def closeEvent(self, event):
+        try:
+            self.main_window.video_widget.videoSink().videoFrameChanged.disconnect(
+                self._receive_video_frame
+            )
+        except (RuntimeError, TypeError):
+            pass
+        if self.main_window._all_media_window is self:
+            self.main_window._all_media_window = None
+        super().closeEvent(event)
+
+
+class AutoDLCSignals(QObject):
+    progress = Signal(object)
+    finished = Signal(object, str)
+
+
+class AutoDLCJob(QRunnable):
+    """Prepare DLC if absent and run inference away from the GUI thread."""
+
+    def __init__(self, video, outdir, mice):
+        super().__init__()
+        self.video = video
+        self.outdir = outdir
+        self.mice = mice
+        self.signals = AutoDLCSignals()
+
+    @Slot()
+    def run(self):
+        from video.dlc_track import run_superanimal_tracking
+        try:
+            csv_path = run_superanimal_tracking(
+                self.video, self.outdir, self.mice, 0.25,
+                progress=self.signals.progress.emit,
+            )
+            self.signals.finished.emit(csv_path, "")
+        except Exception as exc:
+            self.signals.finished.emit(None, str(exc))
+
+
+class LastSpectrogramResizeGrip(QFrame):
+    """Draggable bottom grip that resizes the LAST plot, not an empty pane.
+
+    QSplitter provides handles only between children. The final spectrogram
+    needs a small external mouse grip that changes the inner splitter's
+    TOTAL height and its last plot's size without creating a spacer window.
+    """
+    deltaDragged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_y = None
+        self.setObjectName("last_spectrogram_resize_grip")
+        self.setFixedHeight(14)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip(
+            "Drag vertically to change the last spectrogram's real height."
+        )
+        self.setStyleSheet("""
+            QFrame#last_spectrogram_resize_grip {
+                background: #35505C;
+                border-top: 1px solid #6598A9;
+                border-bottom: 1px solid #1E3038;
+                margin-left: 4px;
+                margin-right: 4px;
+            }
+            QFrame#last_spectrogram_resize_grip:hover {
+                background: #40C9DF;
+            }
+        """)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_y = event.globalPosition().y()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_y is not None:
+            current_y = event.globalPosition().y()
+            delta = round(current_y - self._drag_y)
+            if delta:
+                self._drag_y = current_y
+                self.deltaDragged.emit(delta)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_y = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 class MainWindow(QMainWindow):
     """UI와 분석 파이프라인을 조립하는 controller. 데이터 모델과 알고리즘은 외부 모듈."""
 
-    VIEW_SECONDS = 3.0
+    VIEW_SECONDS = 0.5  # Default X-axis span: 500 milliseconds.
+    MAX_MEDIA_DURATION_S = 5400.0
+    MAX_MEDIA_DURATION_MS = 5_400_000
+    # Video FPS comes from each loaded video's metadata; no assumed default.
 
     def __init__(self):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
 
+        # 250 kS/s WAV: 512-sample Hann window (2.048 ms), 32-sample hop
+        # (0.128 ms). Overview 렌더링은 별도 함수에서 1 ms 수준으로 경량화.
+        self.ui.spin_n_fft.setValue(512)
+        self.ui.spin_hop_length.setValue(32)
+        # 위 값은 기존 분석 파이프라인에서 사용한다.
+        # 스펙트로그램 표시 창(ms)은 별도 GUI에서 지정하며 ratio 분석창과 분리된다.
+        self.ui.spin_n_fft.setToolTip(
+            "Quantitative assignment FFT window (samples). For the visible "
+            "spectrogram use the separate Display STFT window (ms) control."
+        )
+        self.ui.spin_hop_length.setToolTip(
+            "Detail spectrogram time step (samples); ~0.128 ms at 250 kS/s."
+        )
+        self._last_auto_hop_length = 32
+        self._manual_spec_range = None
+        self._manual_freq_range = None
+        self._setting_spectrogram_range = False
+
         self.spectrogram_lut = spectrogram_lookup_table()
         # 고정 컬러스케일: 모든 WAV 채널·모든 시간 구간에 하나의 범위를 사용.
         # 단위는 상대 디지털 STFT 로그 레벨이며 물리적 dB SPL이 아니다.
-        self.spectrogram_levels_db = (-100.0, 0.0)
+        self.spectrogram_levels_db = (-110.0, -35.0)
         self.audio_slots = []  # 길이 = 마이크 개수, 각 원소 AudioData 또는 None
         self.events = []       # 검출/수입된 공통 USVEvent 리스트
         self.spectrogram_views = []
+        self.graph_splitter = None  # Vertical splitter between microphone plots.
+        self._all_media_window = None  # Separate live video + all-channel viewer.
+        # Per-channel mouse coordinate tooltip; no spectrogram recomputation.
+        self.spec_hover_labels = []
+        self.spec_hover_scene_positions = []
         self.channel_fields = []
         self.results = []
         self.analysis_generation = 0  # 설정이 바뀐 뒤 도착하는 이전 분석 결과를 무시.
@@ -541,11 +1132,16 @@ class MainWindow(QMainWindow):
         self.anchor_mapping = None
         self.geometry = None
         self.empirical_cfg = None
-        self.empirical_threshold = None
+        # Manual zero-centered corrected log-ratio boundary: no training CSV.
+        self.empirical_threshold = manual_empirical_threshold(0.5)
         self.analysis_results = {"ratio": [], "distance": [], "geometry": []}
+        self._spectrogram_render_data = []  # Per-channel (dB, time, frequency).
         self.validation_metrics = {}
         self.training_path = None
         self.overlay_items = []
+        self.label_boundary_items = []  # (plot, onset/offset InfiniteLine).
+        self._label_boundary_index = []
+        self._label_boundary_index_signature = None
         # Each microphone has its OWN CSV/TXT labels + reviewed header mapping.
         self.label_path = None  # Legacy alias for first label (old sessions)
         self.label_paths = []
@@ -560,6 +1156,7 @@ class MainWindow(QMainWindow):
         self.video_start_s = None
         self.sync = SyncConfig()
         self.has_video = False
+        self.video_fps = None  # Detected from video metadata; unknown until loaded.
         self.video_duration_ms = 0
         self.window_start_ms = 0
         # Three playback modes are independent:
@@ -582,7 +1179,13 @@ class MainWindow(QMainWindow):
         self.pool.setMaxThreadCount(2)
         self.render_id = 0
         self.render_busy = False
+        self._render_pending = False
+        self._render_request_bounds = (0.0, self.VIEW_SECONDS)
         self.analysis_busy = False
+        self.export_running = False
+        self.export_cancel = None
+        self.export_progress_dialog = None
+        self.export_job = None
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.setInterval(90)  # 드래그 중 불필요한 STFT 재연산 방지
@@ -591,15 +1194,24 @@ class MainWindow(QMainWindow):
         self._setup_channel_controls()
         self._setup_spectrogram_area()
         self._setup_video_player()
+        self._setup_all_media_control()
         self._setup_timeline_markers()
         self._setup_playback_controls()
         self._setup_analysis_controls()
         # Default Analyzing의 기존 위젯을 보존하면서 6개 GroupBox로 정리.
         self._group_settings_controls()
+        self._setup_ratio_only_threshold_control()
+        # Time Synchronization group in Default Analyzing: manual onset + FPS.
+        # Adds runtime widgets without editing generated ui_mainwindow.py.
+        self._setup_manual_sync_controls()
+        self._setup_spectrogram_view_controls()
+        self._setup_audio_calibration_controls()
         # Input Files GroupBox: create one USV label file row per audio channel.
         self._setup_label_controls()
+        self._refresh_calibration_rows()
         # Qt Designer 원본은 그대로 두고 Splitter·패널·스크롤만 런타임 보정.
         self._setup_responsive_layout()
+        self._setup_superanimal_button()
         self._connect_signals()
         # Qt positionChanged is often throttled; poll backend position at 50ms.
         # This timer only READS media positions, never fabricates playback time.
@@ -751,12 +1363,15 @@ class MainWindow(QMainWindow):
         total_height = max(self.ui.splitter_2.height(), 520)
         self.ui.splitter_2.setSizes([185, max(330, total_height - 185)])
 
+        # The 14-pixel last-plot grip is permanently visible directly
+        # above the playback bar; its action changes the plot itself.
+
     def _setup_label_controls(self):
         """1 Audio channel ↔ 1 USV label input, preserving the Designer Ch1 row.
 
-        Existing label widgets are reused. The other N-1 label rows are added
-        to the same Input Files grid, BEFORE the Video Tracking row.
-        The mapping follows channel identity when extra channels are removed.
+        Existing label widgets are reused. The other N-1 rows stay in
+        Default > Input Files. SLEAP tracking is separately placed in
+        Test > Video & SLEAP Tracking and is never moved by label reflow.
         """
         count = len(self.audio_slots)
         self.label_paths = [None] * count
@@ -796,20 +1411,13 @@ class MainWindow(QMainWindow):
         return row
 
     def _reflow_label_grid(self):
-        """Reorder the existing widgets; tracking input always follows N labels."""
+        """Only microphone label files belong here; SLEAP stays in Test tab."""
         if not hasattr(self, "label_rows"):
             return
         grid = self.ui.gridLayout_2
-        tracking = (
-            self.ui.lbl_tracking_file,
-            self.ui.line_tracking_file,
-            self.ui.lbl_tracking_browse,
-        )
         for row in self.label_rows:
             for key in ("label", "path", "browse"):
                 grid.removeWidget(row[key])
-        for widget in tracking:
-            grid.removeWidget(widget)
 
         for index, row in enumerate(self.label_rows):
             row["label"].setText(f"Ch {index+1} Label File")
@@ -824,9 +1432,7 @@ class MainWindow(QMainWindow):
             grid.addWidget(row["path"], index, 1)
             grid.addWidget(row["browse"], index, 2)
 
-        track_row = len(self.label_rows)
-        for column, widget in enumerate(tracking):
-            grid.addWidget(widget, track_row, column)
+        # Tracking input is owned by settings_group_video_tracking in Test.
         grid.setColumnStretch(1, 1)
 
     def _recompute_label_events(self):
@@ -840,6 +1446,11 @@ class MainWindow(QMainWindow):
                 self.label_events, tolerance_s=0.005, min_iou=0.60
             )
         self._invalidate_results()
+        # A channel's lines appear as soon as its label CSV/TXT is loaded,
+        # even before all other channels' files permit merged analysis.
+        self._label_boundary_index_signature = None
+        self._refresh_label_boundaries()
+        self._sync_all_media_window()
         ready = sum(bool(path) for path in self.label_paths)
         self.statusBar().showMessage(
             f"USV labels: {ready}/{len(self.audio_slots)} channels, "
@@ -913,37 +1524,153 @@ class MainWindow(QMainWindow):
         self._sync_channel_fields()
 
     def _setup_spectrogram_area(self):
-        """Re-use latest Designer's audio scroll area and graph container.
+        """Add a real last-plot resize grip, never an expanding blank pane.
 
-        Note: soectrogram_container is the original objectName spelling.
-        verticalLayout_11 now belongs to the distance-correction group.
+        The scroll viewport always fills the available Audio tab area.
+        Each microphone panel is a child of the existing internal splitter.
+        A 14-pixel external grip directly changes the last panel's height
+        and total splitter canvas height (including the scrollbar range).
         """
         self.graph_scroll = self.ui.scrollarea_spectrogram
-        # QScrollArea viewport도 별도 QWidget이므로 명확한 이름으로 QSS를 적용.
-        # 그렇지 않으면 데이터가 비어 있을 때 배경이 주변 패널과 다르게 보임.
-        self.graph_scroll.viewport().setObjectName("spectrogram_scroll_viewport")
+        self.graph_scroll.viewport().setObjectName(
+            "spectrogram_scroll_viewport"
+        )
         self.graph_scroll.setWidgetResizable(True)
         self.graph_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.graph_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self.graph_host = self.ui.spectrogram_container
         self.graph_layout = self.graph_host.layout()
         if self.graph_layout is None:
             self.graph_layout = QVBoxLayout(self.graph_host)
-        # Avoid stacking margins from scroll widget + graph host + each channel.
-        # A single dark surface is used for empty space, axis area and STFT canvas.
         self.graph_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.graph_host.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.ui.horizontalLayout_2.setContentsMargins(0, 0, 0, 0)
         self.ui.horizontalLayout_2.setSpacing(0)
-        self.ui.verticalLayout_9.setContentsMargins(3, 3, 3, 3)
-        self.ui.verticalLayout_9.setSpacing(4)
-        self.ui.verticalLayout_9.setStretch(0, 1)  # graph area gets remaining height
-        self.ui.verticalLayout_9.setStretch(1, 0)  # keep timeline compact
         self.graph_layout.setContentsMargins(2, 2, 2, 2)
         self.graph_layout.setSpacing(3)
+
+        parent_layout = self.ui.verticalLayout_9
+        parent_layout.setContentsMargins(3, 3, 3, 3)
+        parent_layout.setSpacing(2)
+        index = parent_layout.indexOf(self.graph_scroll)
+        if index < 0:
+            raise RuntimeError("Cannot find Audio spectrogram scroll area.")
+
+        # Previous implementation used a SECOND QSplitter with an expanding
+        # dummy pane. That only resized empty space and hid the plots.
+        # Keep graph_scroll in its original layout instead of moving it.
+        self._last_spec_panel_height = None
+        self.last_spectrogram_resize_grip = LastSpectrogramResizeGrip(
+            self.ui.tab_audio
+        )
+        self.last_spectrogram_resize_grip.deltaDragged.connect(
+            self._resize_last_spectrogram
+        )
+        parent_layout.insertWidget(
+            index + 1, self.last_spectrogram_resize_grip, 0
+        )
+        parent_layout.setStretch(index, 1)
+        parent_layout.setStretch(index + 1, 0)
+        # The playback panel remains at index+2, pinned below the grip.
+        parent_layout.setStretch(index + 2, 0)
+
+
+    def _resize_last_spectrogram(self, delta_y):
+        """Change the actual last channel plot height in pixels.
+
+        Drag up -> smaller last plot; drag down -> taller last plot.
+        All other channel heights and their QSplitter handles are preserved.
+        No empty child pane is ever created.
+        """
+        splitter = self.graph_splitter
+        if splitter is None or splitter.count() == 0:
+            return
+
+        heights = splitter.sizes()
+        if len(heights) != splitter.count():
+            return
+        last = splitter.widget(splitter.count() - 1)
+        current_last = max(last.minimumHeight(), int(heights[-1]))
+        new_last = max(
+            last.minimumHeight(),
+            min(1600, current_last + int(delta_y)),
+        )
+        if new_last == current_last:
+            return
+
+        heights[-1] = new_last
+        total_height = (
+            sum(heights) +
+            splitter.handleWidth() * max(0, splitter.count() - 1)
+        )
+        # Without changing the splitter's *actual* total height, Qt would
+        # scale setSizes() back to the old available space instead.
+        splitter.setFixedHeight(total_height)
+        splitter.setSizes(heights)
+        self._last_spec_panel_height = new_last
+        self.graph_host.updateGeometry()
+        self.graph_host.adjustSize()
+        # Keep the resized final plot in view even for long recordings.
+        bar = self.graph_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _setup_all_media_control(self):
+        """Global launch button above the Audio/Video tab contents."""
+        self.show_all_media_button = QPushButton(
+            "Show All Media at Once", self.ui.tab_content
+        )
+        self.show_all_media_button.setObjectName("btn_show_all_media")
+        self.show_all_media_button.setToolTip(
+            "Open video and all microphone spectrograms in a separate "
+            "resizable window using the shared playback clock."
+        )
+        self.ui.tab_content.setCornerWidget(
+            self.show_all_media_button, Qt.Corner.TopRightCorner
+        )
+
+    def show_all_media_at_once(self):
+        """Open or focus the second viewer, retaining the original tabs."""
+        if not self.has_video:
+            QMessageBox.information(
+                self, "All Media", "먼저 Video 파일을 불러오세요."
+            )
+            return
+        if not any(audio is not None for audio in self.audio_slots):
+            QMessageBox.information(
+                self, "All Media", "먼저 Audio WAV/CSV 파일을 불러오세요."
+            )
+            return
+        if self._all_media_window is not None:
+            self._all_media_window.show()
+            self._all_media_window.raise_()
+            self._all_media_window.activateWindow()
+            return
+        popup = AllMediaWindow(self)
+        self._all_media_window = popup
+        popup.show()
+        popup.sync_from_main()
+        if not self._spectrogram_render_data:
+            self.draw_audio(
+                self.ui.slider_timeline_audio.value(), force=True
+            )
+
+    def _sync_all_media_window(self):
+        """Copy the most recently rendered STFT, not the whole WAV file."""
+        popup = getattr(self, "_all_media_window", None)
+        if popup is not None:
+            popup.sync_from_main()
+
+    def _refresh_all_media_cursor(self):
+        """Update lightweight playback text/cursors without copying STFT."""
+        popup = getattr(self, "_all_media_window", None)
+        if popup is not None:
+            popup.refresh_cursor()
 
     def _setup_video_player(self):
         """tab_video의 video QWidget에 별도 비디오 렌더러 삽입."""
@@ -1134,6 +1861,36 @@ class MainWindow(QMainWindow):
                 layout.setAlignment(widget, Qt.AlignmentFlag.AlignVCenter)
             layout.setStretchFactor(slider, 1)
 
+        # Direct time seeking works for both independent media players.
+        # The existing timeline labels keep showing current/total duration.
+        self.audio_seek_edit = QLineEdit(self.ui.playback_panel_audio)
+        self.video_seek_edit = QLineEdit(self.ui.playback_panel_4)
+        for name, edit, panel, layout, time_label in (
+            ("audio", self.audio_seek_edit, self.ui.playback_panel_audio,
+             self.ui.horizontalLayout_4, self.ui.lbl_time_audio),
+            ("video", self.video_seek_edit, self.ui.playback_panel_4,
+             self.ui.horizontalLayout_5, self.ui.lbl_time_video),
+        ):
+            edit.setObjectName(f"input_{name}_seek_time")
+            edit.setFixedWidth(108)
+            edit.setFixedHeight(28)
+            edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            edit.setPlaceholderText("mm:ss.mmm")
+            edit.setText("00:00.000")
+            edit.setToolTip(
+                "Jump to time and press Enter. Accepts seconds (35.25), "
+                "mm:ss.mmm (01:35.250), or hh:mm:ss.mmm (01:02:03.456). "
+                "Audio and Video Sync markers are not changed."
+            )
+            # Place directly BEFORE the live current/total time readout.
+            index = layout.indexOf(time_label)
+            if index < 0:
+                raise RuntimeError(
+                    f"Missing playback time label for {name}."
+                )
+            layout.insertWidget(index, edit)
+            layout.setAlignment(edit, Qt.AlignmentFlag.AlignVCenter)
+
         for sync_btn in (self.ui.btn_starting_audio, self.ui.btn_starting_video):
             sync_btn.setFixedSize(70, 28)
         self.ui.horizontalLayout_4.setAlignment(
@@ -1147,8 +1904,9 @@ class MainWindow(QMainWindow):
         )
 
         # These widgets live outside the splitter; they must not stretch vertically.
-        self.ui.verticalLayout_9.setStretch(0, 1)
-        self.ui.verticalLayout_9.setStretch(1, 0)
+        self.ui.verticalLayout_9.setStretch(0, 1)  # plots/scroll
+        self.ui.verticalLayout_9.setStretch(1, 0)  # last-plot drag grip
+        self.ui.verticalLayout_9.setStretch(2, 0)  # playback
         self.ui.verticalLayout_7.setStretch(0, 1)
         self.ui.verticalLayout_7.setStretch(1, 0)
         self.ui.verticalLayout_15.setSpacing(5)
@@ -1167,11 +1925,10 @@ class MainWindow(QMainWindow):
         self.btn_audio_play.setEnabled(any(a is not None for a in self.audio_slots))
 
     def _group_settings_controls(self):
-        """Default Analyzing 설정을 기능별 6개 GroupBox로 재배치한다.
+        """Move video-assisted settings to Test; keep Time Sync in Default.
 
-        기존 Qt Designer 위젯 자체를 재사용하므로 Browse/FFT/Sync/Geometry/
-        Validation의 objectName과 signal 연결을 유지한다.
-        원본 UI 탭과 ui_mainwindow.py는 건드리지 않는다.
+        Reuse existing Qt Designer widget instances and signal connections.
+        No ui_mainwindow.py edits are required.
 
         verticalLayout_5의 순서 (Qt Designer의 두 layout + 동적 입력 13개):
         0 data inputs, 1 STFT inputs, 2-5 Sync, 6-8 display,
@@ -1193,7 +1950,7 @@ class MainWindow(QMainWindow):
         self.ui.lbl_analysis_file.hide()
         self.ui.lbl_analysis_settings.hide()
         self.ui.lbl_label_file.setText("USV Labels")
-        self.ui.lbl_tracking_file.setText("SLEAP Tracks")
+        self.ui.lbl_tracking_file.setText("Tracking results")
         self.ui.gridLayout_2.setColumnStretch(1, 1)
         self.ui.formLayout.setSizeConstraint(
             QLayout.SizeConstraint.SetDefaultConstraint
@@ -1207,11 +1964,19 @@ class MainWindow(QMainWindow):
             ("Time Synchronization", "settings_group_sync", [2, 3, 4, 5]),
             ("Spectrogram Display", "settings_group_display", [6, 7, 8]),
             ("Geometry & Anchor", "settings_group_geometry", [9, 10, 11]),
-            ("Model Training & Validation", "settings_group_validation",
+            ("Decision Threshold & Validation", "settings_group_validation",
              [12, 13, 14]),
         ]
+        test_group_names = {
+            "settings_group_geometry", "settings_group_validation"
+        }
+        test_groups = []
         for heading, obj_name, member_indexes in groups:
-            group = QGroupBox(heading, self.ui.tab_default_analyze)
+            group = QGroupBox(
+                heading,
+                self.ui.tab_test_analyze if obj_name in test_group_names
+                else self.ui.tab_default_analyze
+            )
             group.setObjectName(obj_name)
             group.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
@@ -1235,8 +2000,508 @@ class MainWindow(QMainWindow):
                     box_layout.addItem(item)
             if obj_name == "settings_group_geometry":
                 box_layout.addWidget(self.label_anchor_mapping)
-            root.addWidget(group)
+            if obj_name in test_group_names:
+                test_groups.append(group)
+            else:
+                root.addWidget(group)
         root.setSpacing(7)
+
+        # Detach the original Designer SLEAP tracking row from the Default
+        # Input Files grid. Never clone inputs: objectNames/signals are kept.
+        tracking_group = QGroupBox(
+            "Video Tracking — SLEAP / DeepLabCut", self.ui.tab_test_analyze
+        )
+        tracking_group.setObjectName("settings_group_video_tracking")
+        tracking_group.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        tracking_grid = QGridLayout(tracking_group)
+        tracking_grid.setContentsMargins(8, 10, 8, 7)
+        tracking_grid.setColumnStretch(1, 1)
+        for column, widget in enumerate((
+            self.ui.lbl_tracking_file, self.ui.line_tracking_file,
+            self.ui.lbl_tracking_browse
+        )):
+            self.ui.gridLayout_2.removeWidget(widget)
+            tracking_grid.addWidget(widget, 0, column)
+
+        # Test: SLEAP/DLC tracking -> geometry/subject mapping ->
+        # user-entered zero-centered log-ratio threshold + validation.
+        test_layout = self.ui.verticalLayout_10
+        test_layout.insertWidget(0, tracking_group)
+        for index, group in enumerate(test_groups, start=1):
+            test_layout.insertWidget(index, group)
+        test_layout.setSpacing(7)
+
+    def _setup_spectrogram_view_controls(self):
+        """Default Analyzing > Spectrogram Display: shared time/frequency view.
+
+        These values control display only, never the ratio-assignment STFT
+        parameters in spin_n_fft / spin_hop_length.
+        """
+        group = self.findChild(QGroupBox, "settings_group_display")
+        if group is None:
+            group = QGroupBox("Spectrogram Display", self.ui.tab_default_analyze)
+            group.setLayout(QVBoxLayout())
+            self.ui.verticalLayout_5.addWidget(group)
+
+        form = QFormLayout()
+        self.spec_time_span_spin = QSpinBox(group)
+        self.spec_time_span_spin.setObjectName("spec_time_span_ms")
+        self.spec_time_span_spin.setRange(10, 10000)
+        self.spec_time_span_spin.setSingleStep(50)
+        self.spec_time_span_spin.setSuffix(" ms")
+        self.spec_time_span_spin.setValue(500)
+        self.spec_time_span_spin.setToolTip(
+            "Visible time span per channel (10–10000 ms). "
+            "The window follows audio/video playback continuously."
+        )
+
+        self.spec_freq_min_spin = QDoubleSpinBox(group)
+        self.spec_freq_max_spin = QDoubleSpinBox(group)
+        for spin, name, initial in (
+            (self.spec_freq_min_spin, "spec_fmin_khz", 0.0),
+            (self.spec_freq_max_spin, "spec_fmax_khz", 150.0),
+        ):
+            spin.setObjectName(name)
+            spin.setRange(0.0, 500.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(5.0)
+            spin.setKeyboardTracking(False)
+            spin.setSuffix(" kHz")
+            spin.setValue(initial)
+        self.spec_freq_max_spin.setToolTip(
+            "The axis may extend beyond Nyquist; bins above audio sr/2 "
+            "remain empty, never extrapolated."
+        )
+
+        self.spec_window_ms_spin = QDoubleSpinBox(group)
+        self.spec_window_ms_spin.setObjectName("spec_stft_window_ms")
+        self.spec_window_ms_spin.setRange(0.5, 20.0)
+        self.spec_window_ms_spin.setDecimals(3)
+        self.spec_window_ms_spin.setSingleStep(0.256)
+        self.spec_window_ms_spin.setKeyboardTracking(False)
+        self.spec_window_ms_spin.setSuffix(" ms")
+        self.spec_window_ms_spin.setValue(4.096)
+        self.spec_window_ms_spin.setToolTip(
+            "Actual Hann STFT window for visualization. At 250 kS/s, "
+            "4.096 ms = 1024 samples, approx. 244 Hz FFT-bin spacing. "
+            "Longer windows sharpen frequency but blur brief USV changes."
+        )
+
+        form.addRow("Time span", self.spec_time_span_spin)
+        form.addRow("Frequency min", self.spec_freq_min_spin)
+        form.addRow("Frequency max", self.spec_freq_max_spin)
+        form.addRow("Display STFT window", self.spec_window_ms_spin)
+        group.layout().addLayout(form)
+
+    def _setup_audio_calibration_controls(self):
+        """Default tab: channel-level gain + measured response calibration.
+
+        Gain and response must both affect the shared STFT feature path. Never
+        rewrite source WAV data, never assume mouse USVs are equal-loudness
+        calibration tones, and never call relative digital dB 'dB SPL'.
+        """
+        group = QGroupBox("Audio Amplitude Calibration", self.ui.tab_default_analyze)
+        group.setObjectName("settings_group_audio_calibration")
+        group.setToolTip(
+            "Use identical reference stimulus/conditions across all channels. "
+            "Ordinary mouse calls are NOT a valid equal-level reference."
+        )
+        layout = QVBoxLayout(group)
+        self.calibration_group = group
+        self.calibration_gain_checkbox = QCheckBox(
+            "Apply inter-channel gain (dB)", group
+        )
+        self.calibration_response_checkbox = QCheckBox(
+            "Apply frequency-response curves (CSV)", group
+        )
+        layout.addWidget(self.calibration_gain_checkbox)
+        layout.addWidget(self.calibration_response_checkbox)
+        self.calibration_gain_checkbox.toggled.connect(self._on_calibration_changed)
+        self.calibration_response_checkbox.toggled.connect(self._on_calibration_changed)
+
+        form = QFormLayout()
+        self.calibration_reference_channel = QComboBox(group)
+        form.addRow("Reference channel", self.calibration_reference_channel)
+        self.calibration_start_s = QDoubleSpinBox(group)
+        self.calibration_end_s = QDoubleSpinBox(group)
+        for control, initial in (
+            (self.calibration_start_s, 0.0),
+            (self.calibration_end_s, 1.0)
+        ):
+            control.setRange(0.0, self.MAX_MEDIA_DURATION_S)
+            control.setDecimals(3)
+            control.setSuffix(" s")
+            control.setValue(initial)
+        form.addRow("Calibration start", self.calibration_start_s)
+        form.addRow("Calibration end", self.calibration_end_s)
+        self.calibration_low_khz = QDoubleSpinBox(group)
+        self.calibration_high_khz = QDoubleSpinBox(group)
+        for control, initial in (
+            (self.calibration_low_khz, 35.0),
+            (self.calibration_high_khz, 100.0)
+        ):
+            control.setRange(0.1, 500.0)
+            control.setDecimals(1)
+            control.setSuffix(" kHz")
+            control.setValue(initial)
+        form.addRow("Calibration min frequency", self.calibration_low_khz)
+        form.addRow("Calibration max frequency", self.calibration_high_khz)
+        layout.addLayout(form)
+
+        self.estimate_gain_button = QPushButton(
+            "Estimate gains from identical reference sound", group
+        )
+        self.estimate_gain_button.setToolTip(
+            "Same calibration stimulus, same emitted level and acoustical "
+            "geometry for all microphones. Estimates a constant dB offset."
+        )
+        self.estimate_gain_button.clicked.connect(
+            self._estimate_interchannel_gains
+        )
+        layout.addWidget(self.estimate_gain_button)
+        self.calibration_rows_host = QWidget(group)
+        self.calibration_rows_layout = QVBoxLayout(self.calibration_rows_host)
+        self.calibration_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.calibration_rows_layout.setSpacing(4)
+        layout.addWidget(self.calibration_rows_host)
+        self.calibration_info = QLabel(
+            "No calibration is applied. CSV headers: frequency_hz,response_db "
+            "(relative microphone sensitivity; correction = −response_db). "
+            "Unmeasured frequencies are NOT extrapolated.", group
+        )
+        self.calibration_info.setWordWrap(True)
+        layout.addWidget(self.calibration_info)
+        self.calibration_rows = []
+        self.ui.verticalLayout_5.addWidget(group)
+
+    def _refresh_calibration_rows(self):
+        """Rebuild input widgets when the microphone count changes."""
+        if not hasattr(self, "calibration_rows_layout"):
+            return
+        previous = self.calibration_reference_channel.currentData()
+        while self.calibration_rows_layout.count():
+            item = self.calibration_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.calibration_rows = []
+        with QSignalBlocker(self.calibration_reference_channel):
+            self.calibration_reference_channel.clear()
+            for index in range(len(self.audio_slots)):
+                self.calibration_reference_channel.addItem(
+                    f"CH {index+1}", index
+                )
+            if isinstance(previous, int) and 0 <= previous < len(self.audio_slots):
+                self.calibration_reference_channel.setCurrentIndex(previous)
+
+        for index, audio in enumerate(self.audio_slots):
+            panel = QWidget(self.calibration_rows_host)
+            box = QHBoxLayout(panel)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.addWidget(QLabel(f"CH {index+1}", panel))
+            db = QDoubleSpinBox(panel)
+            db.setRange(-60.0, 60.0)
+            db.setDecimals(3)
+            db.setSingleStep(0.5)
+            db.setSuffix(" dB")
+            db.setValue(float(audio.gain_db) if audio else 0.0)
+            db.setToolTip("Channel-specific additive dB calibration.")
+            db.valueChanged.connect(
+                lambda value, ch=index: self._set_channel_gain(ch, value)
+            )
+            box.addWidget(db)
+            file_button = QPushButton("Response CSV...", panel)
+            file_button.clicked.connect(
+                lambda checked=False, ch=index: self._load_channel_response(ch)
+            )
+            box.addWidget(file_button)
+            caption = QLabel(panel)
+            caption.setWordWrap(True)
+            caption.setText(
+                Path(audio.response_path).name
+                if audio and audio.response_path else "No response"
+            )
+            caption.setToolTip(
+                audio.response_path if audio and audio.response_path else ""
+            )
+            box.addWidget(caption, 1)
+            self.calibration_rows_layout.addWidget(panel)
+            self.calibration_rows.append((db, caption))
+
+    def _set_channel_gain(self, channel, value):
+        if channel >= len(self.audio_slots):
+            return
+        audio = self.audio_slots[channel]
+        if audio is None:
+            return
+        audio.gain_db = float(value)
+        self._on_calibration_changed()
+
+    def _load_channel_response(self, channel):
+        audio = self.audio_slots[channel] if channel < len(self.audio_slots) else None
+        if audio is None:
+            QMessageBox.information(
+                self, "Frequency Response", "먼저 해당 채널의 WAV를 불러오세요."
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"CH {channel+1} frequency response",
+            "", "Response curve CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            frequencies, response_db = load_frequency_response_csv(path)
+            # Never invent a high-frequency response by extrapolation.
+            # Partial coverage remains visually/testably uncorrected.
+            intended_low = max(18000, self.spec_freq_min_spin.value()*1000)
+            intended_high = min(
+                audio.sr/2, self.spec_freq_max_spin.value()*1000
+            )
+            if frequencies[0] > intended_low or frequencies[-1] < intended_high:
+                QMessageBox.information(
+                    self, "Partial frequency response",
+                    f"CH {channel+1}: response CSV 범위는 "
+                    f"{frequencies[0]/1000:g}–{frequencies[-1]/1000:g} kHz. "
+                    "선택한 초음파 분석 대역을 모두 포함하지 않습니다. "
+                    "측정되지 않은 주파수는 보정하지 않으며 외삽하지 않습니다."
+                )
+            elif frequencies[-1] > audio.sr/2:
+                self.statusBar().showMessage(
+                    "Response CSV extends above this WAV's Nyquist; "
+                    "only measurable bins are corrected.", 9000
+                )
+            audio.response_path = str(path)
+            audio.response_freq_hz = frequencies
+            audio.response_db = response_db
+            self.calibration_rows[channel][1].setText(Path(path).name)
+            self.calibration_rows[channel][1].setToolTip(str(path))
+            self._on_calibration_changed()
+        except Exception as error:
+            QMessageBox.warning(self, "Invalid response CSV", str(error))
+
+    def _on_calibration_changed(self, _=None, *, defer_refresh=False):
+        """Apply independent constant-gain and frequency-response switches.
+
+        Changes invalidate all assignment outputs (including ratio-only),
+        because calibrated STFT amplitudes affect microphone ranking.
+        """
+        if not hasattr(self, "calibration_gain_checkbox"):
+            return
+        loaded = [a for a in self.audio_slots if a is not None]
+        gain_enabled = self.calibration_gain_checkbox.isChecked()
+        response_enabled = self.calibration_response_checkbox.isChecked()
+        if response_enabled and any(a.response_freq_hz is None for a in loaded):
+            missing = ", ".join(
+                a.channel_id for a in loaded if a.response_freq_hz is None
+            )
+            with QSignalBlocker(self.calibration_response_checkbox):
+                self.calibration_response_checkbox.setChecked(False)
+            response_enabled = False
+            self.statusBar().showMessage(
+                "Response correction NOT enabled; missing CSV: "+missing, 11000
+            )
+        for audio in loaded:
+            audio.apply_gain = gain_enabled
+            audio.apply_response = response_enabled
+        if hasattr(self, "calibration_info"):
+            self.calibration_info.setText(
+                "Gain: {} | Response: {} | Result units: relative dB, not SPL. "
+                "Correct response CSV: frequency_hz,response_db; "
+                "unmeasured frequencies remain uncorrected.".format(
+                    "ON" if gain_enabled else "OFF",
+                    "ON" if response_enabled else "OFF"
+                )
+            )
+        # WAV/channel restructuring reuses this method before old plot
+        # widgets are replaced. Avoid rendering a new channel array into
+        # the previous set of plot widgets or its auxiliary media viewer.
+        if defer_refresh:
+            return
+        self._invalidate_results()
+        if hasattr(self, "graph_layout"):
+            self.draw_audio(self.ui.slider_timeline_audio.value(), force=True)
+
+    def _estimate_interchannel_gains(self):
+        """Estimate gain offsets from the SAME known calibration signal.
+
+        Measuring arbitrary mouse calls to equalize channels would erase
+        real source-to-mic attenuation that ratio assignment needs.
+        """
+        loaded = list(self.audio_slots)
+        if len(loaded) < 2 or any(a is None for a in loaded):
+            QMessageBox.warning(
+                self, "Inter-channel calibration",
+                "모든 채널에 WAV 파일을 먼저 불러오세요."
+            )
+            return
+        ref_index = self.calibration_reference_channel.currentData()
+        if ref_index is None:
+            return
+        start = float(self.calibration_start_s.value())
+        end = float(self.calibration_end_s.value())
+        low = 1000.0*float(self.calibration_low_khz.value())
+        high = 1000.0*float(self.calibration_high_khz.value())
+        if not (0 <= start < end and end-start <= 10.0 and 0 < low < high):
+            QMessageBox.warning(
+                self, "Calibration interval",
+                "같은 기준음을 녹음한 0~10초 길이의 구간과 "
+                "정상적인 주파수 범위를 입력하세요."
+            )
+            return
+        if any(end > a.duration_s or high >= a.sr/2 for a in loaded):
+            QMessageBox.warning(
+                self, "Calibration input",
+                "입력 시간은 모든 오디오의 길이 안에 있어야 하며, "
+                "주파수 범위는 모든 채널의 Nyquist보다 낮아야 합니다."
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Reference calibration",
+            "선택 구간은 모든 마이크에서 동일한 레벨·주파수 특성의 "
+            "기준음을 받은 기록인가요?\n"
+            "실제 쥐 발성이나 마이크마다 거리·방향이 다른 신호를 "
+            "정규화하면 개체 할당이 왜곡됩니다. 계속할까요?",
+            QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            levels = [
+                calibration_band_level_db(a, start, end, low, high)
+                for a in loaded
+            ]
+            gain_offsets = [levels[ref_index]-level for level in levels]
+            if any(not np.isfinite(db) or abs(db)>60 for db in gain_offsets):
+                raise ValueError("Calibration difference exceeds ±60 dB.")
+            for index, gain in enumerate(gain_offsets):
+                loaded[index].gain_db = round(float(gain), 3)
+                spin, _ = self.calibration_rows[index]
+                with QSignalBlocker(spin):
+                    spin.setValue(gain)
+            with QSignalBlocker(self.calibration_gain_checkbox):
+                self.calibration_gain_checkbox.setChecked(True)
+            self._on_calibration_changed()
+            values = ", ".join(
+                f"CH {i+1}: {g:+.2f} dB"
+                for i, g in enumerate(gain_offsets)
+            )
+            self.statusBar().showMessage(
+                "Relative gain calibration calculated: "+values, 15000
+            )
+        except Exception as error:
+            QMessageBox.warning(self, "Calibration failed", str(error))
+
+    def _setup_manual_sync_controls(self):
+        """Default Analyzing의 기존 Time Synchronization GroupBox에 수동 입력 추가.
+
+        _group_settings_controls() 실행 이후 호출하므로 원래 15개
+        Designer layout/widget 이동 순서를 망가뜨리지 않는다.
+        """
+        group = self.findChild(QGroupBox, "settings_group_sync")
+        if group is None:
+            # Designer layout 변경 시에도 Sync 입력은 별도 그룹으로 표시.
+            group = QGroupBox("Time Synchronization", self.ui.tab_default_analyze)
+            self.ui.verticalLayout_5.addWidget(group)
+            group.setLayout(QVBoxLayout())
+
+        form = QFormLayout()
+        self.manual_audio_onset_spin = QDoubleSpinBox(group)
+        self.manual_video_onset_spin = QDoubleSpinBox(group)
+        for spin, name in (
+            (self.manual_audio_onset_spin, "manual_audio_onset_s"),
+            (self.manual_video_onset_spin, "manual_video_onset_s"),
+        ):
+            spin.setObjectName(name)
+            spin.setRange(0.0, self.MAX_MEDIA_DURATION_S)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.001)
+            spin.setSuffix(" s")
+            spin.setKeyboardTracking(False)
+            spin.setToolTip(
+                "동일한 Sync 이벤트의 절대 발생 시각 (0~5400.000 s, 1 ms 단위)."
+            )
+
+        # FPS is a read-only value detected from the loaded video file.
+        self.video_fps_label = QLabel("— (load video)", group)
+        self.video_fps_label.setObjectName("label_detected_video_fps")
+        self.video_fps_label.setToolTip(
+            "Detected from video metadata and used for SLEAP frame_idx / FPS."
+        )
+
+        form.addRow("Audio onset (s)", self.manual_audio_onset_spin)
+        form.addRow("Video onset (s)", self.manual_video_onset_spin)
+        form.addRow("Video FPS (auto)", self.video_fps_label)
+        group.layout().addLayout(form)
+        self.apply_manual_sync_button = QPushButton("Apply Manual Sync", group)
+        self.apply_manual_sync_button.setObjectName("btn_apply_manual_sync")
+        self.apply_manual_sync_button.setToolTip(
+            "같은 사건의 Audio/Video onset을 정렬: offset = Audio - Video"
+        )
+        group.layout().addWidget(self.apply_manual_sync_button)
+
+    def _setup_ratio_only_threshold_control(self):
+        """Default Analyzing: measured channel-level dB gap decision threshold.
+
+        Separate from Test Analyzing's dimensionless corrected log-ratio T.
+        Created after the original 15-item settings regrouping so that this
+        widget cannot disrupt Qt Designer's layout grouping invariant.
+        """
+        root = self.ui.verticalLayout_5
+        group = QGroupBox("Ratio-only Assignment", self.ui.tab_default_analyze)
+        group.setObjectName("settings_group_ratio_only")
+        group.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        form = QFormLayout(group)
+        form.setContentsMargins(8, 10, 8, 7)
+        form.setSpacing(6)
+
+        self.ratio_only_margin_spin = QDoubleSpinBox(group)
+        self.ratio_only_margin_spin.setObjectName(
+            "ratio_only_min_margin_db"
+        )
+        self.ratio_only_margin_spin.setRange(0.0, 60.0)
+        self.ratio_only_margin_spin.setDecimals(3)
+        self.ratio_only_margin_spin.setSingleStep(0.1)
+        self.ratio_only_margin_spin.setSuffix(" dB")
+        self.ratio_only_margin_spin.setValue(0.1)
+        self.ratio_only_margin_spin.setToolTip(
+            "Minimum dB difference between the two strongest calibrated "
+            "microphone channel levels. Assign if margin >= threshold; "
+            "otherwise Unassigned. Default 0.1 dB."
+        )
+        form.addRow("Minimum channel level difference", self.ratio_only_margin_spin)
+        explain = QLabel(
+            "Ratio-only: top two microphone levels must differ by at least "
+            "the entered dB threshold. This is NOT Test Analyzing's "
+            "corrected log-ratio threshold.",
+            group,
+        )
+        explain.setWordWrap(True)
+        form.addRow(explain)
+
+        # Insert immediately below STFT parameters, including when the
+        # optional grouping step had to retain the original Designer layout.
+        stft_group = self.findChild(QGroupBox, "settings_group_stft")
+        insert_at = root.indexOf(stft_group) + 1 if stft_group else 2
+        root.insertWidget(max(0, min(insert_at, root.count())), group)
+        self.ratio_only_margin_spin.valueChanged.connect(
+            self._on_ratio_only_margin_changed
+        )
+
+
+    def _on_ratio_only_margin_changed(self, margin_db):
+        """Invalidate stored and in-flight results after threshold changes."""
+        self._invalidate_results()
+        self.statusBar().showMessage(
+            f"Ratio-only minimum dB margin: {margin_db:.3f} dB. "
+            "Rerun assignment to apply.",
+            5000,
+        )
+
 
     def _setup_analysis_controls(self):
         """기존 settings_panel에 추적/캘리브레이션 및 결과 내보내기 버튼 추가."""
@@ -1248,7 +2513,7 @@ class MainWindow(QMainWindow):
         self.ui.btn_distance_corr.setText("Run Distance-only")
         self.ui.btn_distance_corr.setToolTip(
             "R_corr = ln(A/B) / max(omega_d, omega_min); "
-            "requires validated Audio↔Video mapping and training threshold."
+            "requires Audio↔Video mapping and a user-selected log-ratio threshold."
         )
         self.ui.group_geo_corr.setTitle("Distance + Angle Correction")
         self.ui.btn_geo_corr.setText("Run Distance + Angle")
@@ -1256,7 +2521,7 @@ class MainWindow(QMainWindow):
             "Uses distance omega_d and direction omega_theta together."
         )
         self.offset_spin = QDoubleSpinBox(self.ui.settings_panel)
-        self.offset_spin.setRange(-3600, 3600)
+        self.offset_spin.setRange(-self.MAX_MEDIA_DURATION_S, self.MAX_MEDIA_DURATION_S)
         self.offset_spin.setDecimals(3)
         self.offset_spin.setSuffix(" s")
         # offset은 두 Sync 버튼으로 산출되는 읽기 전용 값이다.
@@ -1328,14 +2593,41 @@ class MainWindow(QMainWindow):
         self.label_anchor_mapping.setObjectName("label_audio_video_mapping")
         self.label_anchor_mapping.setWordWrap(True)
 
-        # 별도의 정답 데이터로 baseline/보정식의 효과를 평가한다.
-        # ground-truth CSV는 학습/임계값 선택에 사용한 파일과 달라야 한다.
-        # Training R_corr 데이터의 median/MAD를 학습한다 (validation 분리 필수).
-        self.training_button = QPushButton("Fit median/MAD from training CSV", self.ui.settings_panel)
-        self.training_button.setToolTip(
-            "같은 empirical 설정에서 계산된 R_corr 열을 사용해 R_mid와 MAD 학습"
+        # One root layout item: preserve the 15-item grouping invariant.
+        # Manual threshold applies to corrected NATURAL-LOG amplitude ratio,
+        # not raw A/B and not a fitted median/MAD. Center is fixed at zero.
+        self.manual_threshold_panel = QWidget(self.ui.settings_panel)
+        threshold_layout = QVBoxLayout(self.manual_threshold_panel)
+        threshold_layout.setContentsMargins(0, 2, 0, 2)
+        threshold_layout.setSpacing(4)
+        threshold_layout.addWidget(QLabel(
+            "Manual corrected log-ratio threshold |R_corr| (center = 0)",
+            self.manual_threshold_panel,
+        ))
+        self.manual_ratio_threshold_spin = QDoubleSpinBox(
+            self.manual_threshold_panel
         )
-        self.ui.verticalLayout_5.addWidget(self.training_button)
+        self.manual_ratio_threshold_spin.setObjectName(
+            "manual_log_ratio_threshold"
+        )
+        self.manual_ratio_threshold_spin.setDecimals(4)
+        self.manual_ratio_threshold_spin.setRange(0.0, 100.0)
+        self.manual_ratio_threshold_spin.setSingleStep(0.01)
+        self.manual_ratio_threshold_spin.setValue(0.5)
+        self.manual_ratio_threshold_spin.setToolTip(
+            "T in natural-log units: R_corr > +T assigns A, "
+            "R_corr < -T assigns B; otherwise unassigned. "
+            "Examples: 0.03, 0.5, 1.0. No training CSV required."
+        )
+        threshold_layout.addWidget(self.manual_ratio_threshold_spin)
+        info = QLabel(
+            "Decision: A if R_corr > +T; B if R_corr < -T; "
+            "otherwise Unassigned. No median/MAD training required.",
+            self.manual_threshold_panel,
+        )
+        info.setWordWrap(True)
+        threshold_layout.addWidget(info)
+        self.ui.verticalLayout_5.addWidget(self.manual_threshold_panel)
         self.validation_button = QPushButton("Validate with ground-truth CSV", self.ui.settings_panel)
         self.validation_button.setToolTip(
             "onset_s, offset_s, mouse_id가 있는 별도 검증 데이터로 coverage/accuracy 평가"
@@ -1357,6 +2649,7 @@ class MainWindow(QMainWindow):
             lambda checked=False: self.open_audio_channel(1)
         )
         self.ui.btn_video_browse.clicked.connect(self.open_video)
+        self.show_all_media_button.clicked.connect(self.show_all_media_at_once)
         self.ui.btn_label_browse.clicked.connect(self.open_label)
         # 최신 원본 UI에서 추적파일 Browse의 objectName은 lbl_tracking_browse.
         self.ui.lbl_tracking_browse.clicked.connect(self.open_tracking)
@@ -1368,6 +2661,12 @@ class MainWindow(QMainWindow):
         self.ui.btn_geo_show.clicked.connect(lambda: self.show_result_overlay("geometry"))
         self.ui.btn_save_process.clicked.connect(self.save_process)
         self.ui.btn_open_file.clicked.connect(self.open_process)
+        self.ui.btn_save_pdf.setText("Export PDF / MP4")
+        self.ui.btn_save_pdf.setToolTip(
+            "PDF: visible spectrogram time window plus current video frame. "
+            "MP4: ENTIRE audio recording with rolling spectrogram and "
+            "synchronized video (may take a long time)."
+        )
         self.ui.btn_save_pdf.clicked.connect(self.save_pdf)
         # 최신 Designer 상단의 CSV 저장과 분석 탭의 Plot 버튼을 연결한다.
         self.ui.btn_plot_spectrogram.clicked.connect(self._redraw_current_window)
@@ -1381,6 +2680,13 @@ class MainWindow(QMainWindow):
         )
         self.ui.slider_timeline_audio.sliderMoved.connect(
             self._on_audio_timeline_seek
+        )
+        # Enter a timestamp to seek without changing either Sync anchor.
+        self.audio_seek_edit.returnPressed.connect(
+            self._seek_audio_from_text
+        )
+        self.video_seek_edit.returnPressed.connect(
+            self._seek_video_from_text
         )
         self.audio_preview_player.positionChanged.connect(
             self._on_audio_preview_position
@@ -1410,15 +2716,23 @@ class MainWindow(QMainWindow):
         )
         self.color_min_spin.valueChanged.connect(self._on_color_limits_changed)
         self.color_max_spin.valueChanged.connect(self._on_color_limits_changed)
+        for spin in (
+            self.spec_time_span_spin, self.spec_freq_min_spin,
+            self.spec_freq_max_spin, self.spec_window_ms_spin
+        ):
+            spin.valueChanged.connect(self._on_spectrogram_view_settings_changed)
         # Sync 버튼은 상대 매체로 탐색하는 대신 현재 기준점을 고정한다.
         self.ui.btn_starting_audio.clicked.connect(self.mark_audio_start)
         self.ui.btn_starting_video.clicked.connect(self.mark_video_start)
         self.reset_sync_button.clicked.connect(self.reset_sync_starts)
+        self.apply_manual_sync_button.clicked.connect(self.apply_manual_sync)
         self._refresh_sync_labels()
         self.geometry_button.clicked.connect(self.open_geometry)
         self.anchor_button.clicked.connect(self.review_anchor)
         self._update_audio_video_mapping_status()
-        self.training_button.clicked.connect(self.fit_training_threshold)
+        self.manual_ratio_threshold_spin.valueChanged.connect(
+            self.set_manual_ratio_threshold
+        )
         self.validation_button.clicked.connect(self.validate_results)
         self.export_button.clicked.connect(self.export_results)
 
@@ -1582,6 +2896,9 @@ class MainWindow(QMainWindow):
             self._stop_audio_preview()
             self._update_audio_playback_channels()
         if hasattr(self, "graph_layout"):
+            self._refresh_calibration_rows()
+            self._on_calibration_changed(defer_refresh=True)
+            self._invalidate_results()
             self._rebuild_plots()
             self._refresh_audio_state()
             self.draw_audio(0, force=True)
@@ -1633,28 +2950,158 @@ class MainWindow(QMainWindow):
         return {f"ch{i+1}": mid for i, mid in enumerate(ids)}
 
 
+    def eventFilter(self, watched, event):
+        """Hide cursor-coordinate labels when the pointer leaves a plot."""
+        if event.type() == QEvent.Type.Leave:
+            for index, view in enumerate(getattr(self, "spectrogram_views", [])):
+                plot = view[0]
+                if watched is plot.viewport():
+                    if index < len(self.spec_hover_labels):
+                        self.spec_hover_labels[index].hide()
+                        self.spec_hover_scene_positions[index] = None
+                    break
+        return super().eventFilter(watched, event)
+
+    def _on_spec_mouse_moved(self, index, scene_pos):
+        """Show exact cursor-tip plot coordinates (absolute ms, Hz).
+
+        The scene pixel point is mapped through this channel's ViewBox, so
+        pan/zoom, linked axes and rolling playback never alter its meaning.
+        """
+        if (index >= len(self.spectrogram_views)
+            or index >= len(self.spec_hover_labels)
+            or index >= len(self.audio_slots)):
+            return
+        plot, _, _ = self.spectrogram_views[index]
+        label = self.spec_hover_labels[index]
+        viewbox = plot.getViewBox()
+        if (self.audio_slots[index] is None
+            or not plot.isVisible()
+            or not viewbox.sceneBoundingRect().contains(scene_pos)):
+            label.hide()
+            self.spec_hover_scene_positions[index] = None
+            return
+
+        point = viewbox.mapSceneToView(scene_pos)
+        time_s, freq_hz = float(point.x()), float(point.y())
+        if not np.isfinite([time_s, freq_hz]).all():
+            label.hide()
+            self.spec_hover_scene_positions[index] = None
+            return
+
+        # Absolute WAV timeline in milliseconds; frequency axis in Hz.
+        # Decimal display must not be mistaken for actual STFT resolution.
+        label.setText(f"{time_s * 1000:,.2f} ms  |  {freq_hz:,.0f} Hz")
+
+        # Place near, not underneath, the cursor. Reverse direction at edges.
+        units_per_px_x, units_per_px_y = viewbox.viewPixelSize()
+        view_rect = viewbox.viewRect()
+        at_right = time_s > view_rect.center().x()
+        at_top = freq_hz > view_rect.center().y()
+        label.setAnchor((1 if at_right else 0, 0 if at_top else 1))
+        label.setPos(
+            time_s + (-12 if at_right else 12) * abs(units_per_px_x),
+            freq_hz + (-12 if at_top else 12) * abs(units_per_px_y)
+        )
+        label.show()
+        # Keep the last position so a stationary mouse gets fresh coordinates
+        # when the spectrogram axes roll during video/audio playback.
+        self.spec_hover_scene_positions[index] = (
+            float(scene_pos.x()), float(scene_pos.y())
+        )
+
     def _rebuild_plots(self):
-        """스펙트로그램 위젯 개수는 항상 마이크 개수와 같게 유지."""
+        """Create resizable spectrogram panels separated by draggable handles.
+
+        Channel additions/removals rebuild the splitter while retaining
+        existing panel sizes when possible. Normal STFT redraw and playback
+        never recreate the widgets, so manual heights remain untouched.
+        """
+        old_sizes = (
+            self.graph_splitter.sizes()
+            if self.graph_splitter is not None else []
+        )
         self._clear_layout(self.graph_layout)
+        self.graph_splitter = QSplitter(Qt.Orientation.Vertical, self.graph_host)
+        self.graph_splitter.setObjectName("spectrogram_splitter")
+        self.graph_splitter.setChildrenCollapsible(False)
+        self.graph_splitter.setHandleWidth(12)
+        self.graph_splitter.setOpaqueResize(True)
+        self.graph_splitter.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        # Visible horizontal grip, including when app-wide QSS is outdated.
+        self.graph_splitter.setStyleSheet("""
+            QSplitter#spectrogram_splitter::handle:vertical {
+                background: #35505C;
+                border-top: 1px solid #638190;
+                border-bottom: 1px solid #1E2A32;
+                margin: 2px 5px;
+            }
+            QSplitter#spectrogram_splitter::handle:vertical:hover {
+                background: #4AA8C2;
+            }
+        """)
+        # The scroll area keeps a tall canvas by default. Individual plots
+        # may shrink to 175 px when dragging, instead of being locked at 345 px.
+        channel_count = len(self.audio_slots)
+        self.graph_splitter.setMinimumHeight(
+            max(0, channel_count * 345 + max(0, channel_count - 1) * 12)
+        )
+        self.graph_layout.addWidget(self.graph_splitter, 1)
+        # 새 WAV/채널 구성에서 과거 마우스 확대 위치를 복원하지 않는다.
+        self._manual_spec_range = None
+        self._manual_freq_range = None
         self.overlay_items = []
+        self.label_boundary_items = []  # Owned by rebuilt QSplitter panels.
         self.spectrogram_views = []
+        self._spectrogram_render_data = []
+        self.spec_hover_labels = []
+        self.spec_hover_scene_positions = []
         self.audio_anchor_lines = []
         for index, audio in enumerate(self.audio_slots):
             # Channel separators are subtle; the plot fills the whole card
             # rather than sitting inside several padded frames.
-            panel = QWidget(self.graph_host)
+            panel = QWidget(self.graph_splitter)
             panel.setObjectName("spectrogram_channel_panel")
             panel.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
             )
+            # Default is ~345 px per channel; allow drag down to this minimum.
+            panel.setMinimumHeight(190)
             layout = QVBoxLayout(panel)
             layout.setContentsMargins(2, 1, 2, 2)
             layout.setSpacing(2)
             title = f"ch{index+1} | {audio.path.name if audio else 'No WAV'}"
+            if audio is not None and audio.sr / 2 < SPECTROGRAM_FREQ_MAX_HZ:
+                # A 250 kS/s WAV cannot contain physically measured 150-kHz bins.
+                title += f" | Nyquist {audio.sr / 2000:g} kHz (upper area unavailable)"
             title_label = QLabel(title, panel)
             title_label.setObjectName("spectrogram_channel_title")
             title_label.setFixedHeight(20)
-            layout.addWidget(title_label)
+            title_label.setMinimumWidth(0)
+            title_label.setToolTip(title)
+            title_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
+            header_row = QHBoxLayout()
+            header_row.setContentsMargins(0, 0, 0, 0)
+            header_row.setSpacing(7)
+            header_row.addWidget(title_label, 1)
+            boundary_legend = QLabel(panel)
+            boundary_legend.setObjectName("usv_onset_offset_legend")
+            boundary_legend.setText(
+                "<span style='color:#B8EE88'>│ Onset</span>"
+                "&nbsp;&nbsp;"
+                "<span style='color:#FF86B2'>┆ Offset</span>"
+            )
+            boundary_legend.setToolTip(
+                "USV label boundaries: onset = green solid line, "
+                "offset = pink dashed line. Playback is amber; Sync is cyan."
+            )
+            boundary_legend.setFixedHeight(20)
+            header_row.addWidget(boundary_legend, 0)
+            layout.addLayout(header_row)
 
             # QSS does not own GraphicsView's plot background: set it here.
             plot = pg.PlotWidget(panel)
@@ -1664,6 +3111,7 @@ class MainWindow(QMainWindow):
             )
             # Two channels should fit on a normal-height workspace; on a larger
             # window each graph expands to use the spare height.
+            # Keep the normal view tall, but do not block the splitter handles.
             plot.setMinimumHeight(155)
             plot.setFrameShape(QFrame.Shape.NoFrame)
             plot.setBackground(SPECTROGRAM_BG)
@@ -1690,16 +3138,51 @@ class MainWindow(QMainWindow):
                 )
                 empty_text.setPos(0.5, 0.5)
                 plot.addItem(empty_text, ignoreBounds=True)
+            else:
+                # Initial axes reflect the shared display settings.
+                plot.setXRange(
+                    0.0, self.spec_time_span_spin.value() / 1000.0, padding=0
+                )
+                plot.setYRange(
+                    self.spec_freq_min_spin.value() * 1000.0,
+                    self.spec_freq_max_spin.value() * 1000.0, padding=0
+                )
             image = pg.ImageItem(axisOrder="col-major")
             image.setLookupTable(self.spectrogram_lut)
             image.setLevels(self.spectrogram_levels_db)  # 생성부터 고정 레벨 적용
             plot.addItem(image)
+
+            # Live pointer coordinate label. A TextItem is attached to the plot
+            # coordinate system and ignored by auto-range; it cannot affect STFT.
+            hover = pg.TextItem(
+                text="", color="#E8F4F8", anchor=(0, 1),
+                border=pg.mkPen("#547481", width=1),
+                fill=pg.mkBrush(22, 29, 35, 235)
+            )
+            hover.setZValue(200)
+            hover.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            hover.setAcceptHoverEvents(False)
+            plot.addItem(hover, ignoreBounds=True)
+            hover.hide()
+            self.spec_hover_labels.append(hover)
+            self.spec_hover_scene_positions.append(None)
+
+            # The graphics view emits hover even without mouse button presses.
+            plot.setMouseTracking(True)
+            plot.viewport().setMouseTracking(True)
+            plot.viewport().installEventFilter(self)
+            plot.scene().sigMouseMoved.connect(
+                lambda scene_pos, channel=index: self._on_spec_mouse_moved(
+                    channel, scene_pos
+                )
+            )
             # 동기화 기준점(시안)과 현재 재생 위치(앰버)를 구분.
             playhead = pg.InfiniteLine(
                 angle=90, pen=pg.mkPen(SPECTROGRAM_PLAYHEAD, width=1.6),
                 movable=False
             )
             plot.addItem(playhead)
+            playhead.setZValue(90)  # Playback stays above onset/offset markers.
             playhead.setVisible(self._sync_is_ready())
             # 초록색 점선은 고정한 오디오 기준점으로, 타임라인 이동에 영향을 받지 않는다.
             anchor_line = pg.InfiniteLine(
@@ -1707,18 +3190,57 @@ class MainWindow(QMainWindow):
                                       style=Qt.PenStyle.DashLine), movable=False
             )
             plot.addItem(anchor_line)
+            anchor_line.setZValue(80)  # Sync remains above the label boundaries.
             anchor_line.setVisible(self.audio_start_s is not None)
             if self.audio_start_s is not None:
                 anchor_line.setValue(self.audio_start_s)
             if self.spectrogram_views:
                 plot.setXLink(self.spectrogram_views[0][0])
+                plot.setYLink(self.spectrogram_views[0][0])
+            else:
+                # All channels follow the same interactive X/Y viewing range.
+                plot.getViewBox().sigXRangeChanged.connect(
+                    self._on_spectrogram_xrange_changed
+                )
+                plot.getViewBox().sigYRangeChanged.connect(
+                    self._on_spectrogram_yrange_changed
+                )
             self.spectrogram_views.append((plot, image, playhead))
             self.audio_anchor_lines.append(anchor_line)
             layout.addWidget(plot, 1)
-            # Equal stretch makes N channel charts share the viewport height.
-            # If N exceeds available space, QScrollArea handles vertical scroll.
-            self.graph_layout.addWidget(panel, 1)
-        # No trailing stretch: it previously consumed height without showing data.
+            # QSplitter inserts a draggable horizontal handle between channels.
+            # The outer QScrollArea still scrolls if the total is taller
+            # than its viewport, including for up to 16 microphones.
+            self.graph_splitter.addWidget(panel)
+
+        if channel_count:
+            preferred = [
+                max(190, int(old_sizes[i]))
+                if i < len(old_sizes) and old_sizes[i] > 0 else 345
+                for i in range(channel_count)
+            ]
+            # Retain the user's last-channel resize across channel rebuilds.
+            if self._last_spec_panel_height is not None:
+                preferred[-1] = max(190, self._last_spec_panel_height)
+                total = (
+                    sum(preferred) +
+                    self.graph_splitter.handleWidth() * (channel_count - 1)
+                )
+                self.graph_splitter.setFixedHeight(total)
+            splitter = self.graph_splitter
+            # Defer once: QScrollArea/layout geometry may not yet be resolved
+            # while the graph widgets are being created.
+            QTimer.singleShot(
+                0,
+                lambda current=splitter, sizes=preferred:
+                    current.setSizes(sizes)
+                    if self.graph_splitter is current else None
+            )
+        # The 14px bottom grip adjusts the last channel's REAL plotted height.
+        # The inner splitter still controls boundaries between microphones.
+        if self._all_media_window is not None:
+            self._all_media_window.rebuild_channels()
+            self._sync_all_media_window()
 
     def _validate_slots(self, slots):
         loaded = [a for a in slots if a is not None]
@@ -1788,6 +3310,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Audio loading", str(error))
 
     def _apply_audio_update(self):
+        # 상세 STFT의 프레임 간격을 약 0.128 ms로 자동 맞춘다.
+        # 사용자가 hop을 직접 변경했다면 기존 입력값을 유지한다.
+        loaded = [a for a in self.audio_slots if a is not None]
+        if loaded and self.ui.spin_hop_length.value() == self._last_auto_hop_length:
+            auto_hop = max(1, min(
+                self.ui.spin_n_fft.value(), int(round(loaded[0].sr * 0.000128))
+            ))
+            self._last_auto_hop_length = auto_hop
+            self.ui.spin_hop_length.setValue(auto_hop)
         # File replacement invalidates an ongoing audible preview of old samples.
         self._stop_audio_preview()
         self._update_audio_playback_channels()
@@ -1805,6 +3336,8 @@ class MainWindow(QMainWindow):
         else:
             self._invalidate_results()
         self._clear_sync_starts()
+        self._refresh_calibration_rows()
+        self._on_calibration_changed(defer_refresh=True)
         self._rebuild_plots()
         self._refresh_audio_state()
         self.draw_audio(0, force=True)
@@ -1817,8 +3350,8 @@ class MainWindow(QMainWindow):
         )
         duration = min((a.duration_s for a in loaded), default=0.0)
         # Audio slider represents absolute PLAYHEAD seconds, not the left edge
-        # of the 3s spectrogram window. Previous range duration-3s prevented
-        # the slider from moving at all for recordings <=3 seconds.
+        # of the 500 ms spectrogram window. Previous range duration-window
+        # could prevent the slider from moving for short recordings.
         total_ms = max(0, int(round(duration * 1000)))
         with QSignalBlocker(self.ui.slider_timeline_audio):
             self.ui.slider_timeline_audio.setRange(0, total_ms)
@@ -1850,55 +3383,157 @@ class MainWindow(QMainWindow):
         self.color_scale_info.setText(
             f"Fixed for all channels/time: {minimum:g} to {maximum:g} dB rel."
         )
+        self._sync_all_media_window()
+
+    def _spectrogram_span_ms(self):
+        """Current shared spectrogram time width, independent of audio duration."""
+        return int(self.spec_time_span_spin.value())
+
+    def _on_spectrogram_view_settings_changed(self, _=None):
+        """Re-render in the same PlotWidget with the requested time/frequency range."""
+        if self.spec_freq_min_spin.value() >= self.spec_freq_max_spin.value():
+            self.statusBar().showMessage(
+                "Frequency minimum must be smaller than maximum.", 6000
+            )
+            return
+        self._manual_spec_range = None
+        self._manual_freq_range = None
+        self.draw_audio(self.ui.slider_timeline_audio.value(), force=True)
+
+    def _on_spectrogram_xrange_changed(self, viewbox, x_range):
+        """A manual X zoom becomes a rolling time span, not a one-shot frame."""
+        if self._setting_spectrogram_range or not any(
+            audio is not None for audio in self.audio_slots
+        ):
+            return
+        left, right = map(float, x_range)
+        if not np.isfinite([left, right]).all() or right <= left:
+            return
+        duration = min(
+            (audio.duration_s for audio in self.audio_slots if audio is not None),
+            default=0.0
+        )
+        left = max(0.0, min(left, duration))
+        right = max(0.0, min(right, duration))
+        if right - left < 0.005:
+            return
+        if right - left > 10.0:
+            # Double-click AutoRange can expose the full recording. Do not
+            # calculate tens of minutes of STFT or lose configured defaults.
+            self._manual_spec_range = None
+            self._queue_spectrogram_render()
+            return
+        new_range = (left, right)
+        if self._manual_spec_range == new_range:
+            return
+        self._manual_spec_range = new_range
+        self._queue_spectrogram_render()
+
+    def _on_spectrogram_yrange_changed(self, viewbox, y_range):
+        """Keep user Y-axis zoom/scroll across subsequent playback renders."""
+        if self._setting_spectrogram_range:
+            return
+        low, high = map(float, y_range)
+        if not np.isfinite([low, high]).all() or high <= low:
+            return
+        default_low = self.spec_freq_min_spin.value() * 1000.0
+        default_high = self.spec_freq_max_spin.value() * 1000.0
+        if abs(low-default_low) < 1.0 and abs(high-default_high) < 1.0:
+            self._manual_freq_range = None
+        else:
+            self._manual_freq_range = (low, high)
+
+    def _queue_spectrogram_render(self, live=False):
+        """Coalesce work while an STFT worker is busy; don't starve live views."""
+        if self.render_busy:
+            self._render_pending = True
+            return
+        self.render_id += 1
+        self.render_timer.start(0 if live else 90)
 
     def _redraw_current_window(self, _=None):
         self.draw_audio(self.ui.slider_timeline_audio.value(), force=True)
 
     def draw_audio(self, position_ms, force=False):
-        """Absolute playhead in milliseconds; redraw STFT only on window shift.
+        """Move the playhead and roll the selected view without changing its width.
 
-        For a 2s audio the timeline range is 0..2000ms (NOT 0..0ms).
-        The waveform cursor can advance at 50ms intervals while the
-        expensive 3s STFT is only regenerated when the visible window changes.
+        A manually selected zoom retains its duration while playback continues.
+        The configured default span also remains active for all later times.
         """
         total_ms = self.ui.slider_timeline_audio.maximum()
         head_ms = max(0, min(int(position_ms), total_ms))
         self._audio_cursor_ms = head_ms
+        if (hasattr(self, "audio_seek_edit")
+            and not self.audio_seek_edit.hasFocus()):
+            self.audio_seek_edit.setText(self._format_ms(head_ms))
+        self._refresh_all_media_cursor()
         self.ui.lbl_time_audio.setText(
             f"{self._format_ms(head_ms)} / {self._format_ms(total_ms)}"
         )
         for _, _, playhead in self.spectrogram_views:
-            playhead.setValue(head_ms / 1000)
+            playhead.setValue(head_ms / 1000.0)
             playhead.setVisible(total_ms > 0)
 
-        window_ms = int(round(self.VIEW_SECONDS * 1000))
-        window_end_ms = self.window_start_ms + window_ms
+        if not any(audio is not None for audio in self.audio_slots):
+            return
+
+        live = self._play_all_active or self._audio_preview_active
+        if self._manual_spec_range is not None:
+            left_s, right_s = self._manual_spec_range
+            width_ms = max(5, int(round((right_s-left_s)*1000.0)))
+            # Follow the real audio/video clock. No automatic zoom reset.
+            if (head_ms < int(round(left_s*1000))
+                or head_ms >= int(round(left_s*1000 + 0.80*width_ms))):
+                max_start = max(0, total_ms - width_ms)
+                new_start = min(max_start, max(0, head_ms - int(width_ms*0.20)))
+                new_range = (new_start/1000.0, (new_start+width_ms)/1000.0)
+                if new_range != self._manual_spec_range:
+                    self._manual_spec_range = new_range
+                    self._queue_spectrogram_render(live=live)
+                    return
+            if force:
+                self._queue_spectrogram_render(live=live)
+            return
+
+        width_ms = self._spectrogram_span_ms()
         need_redraw = (
             force or head_ms < self.window_start_ms
-            or head_ms >= self.window_start_ms + int(window_ms * 0.85)
+            or head_ms >= self.window_start_ms + int(width_ms * 0.80)
         )
         if not need_redraw:
             return
-        max_start = max(0, total_ms - window_ms)
-        new_start = min(
-            max_start, max(0, head_ms - int(window_ms * 0.20))
-        )
+        max_start = max(0, total_ms - width_ms)
+        new_start = min(max_start, max(0, head_ms - int(width_ms * 0.20)))
         if new_start == self.window_start_ms and not force:
             return
         self.window_start_ms = new_start
-        self.render_id += 1
-        self.render_timer.start()
+        self._queue_spectrogram_render(live=live)
 
     def _start_render(self):
         if self.render_busy:
-            return  # 이전 worker 완료 시 최신 render_id로 다시 예약.
+            self._render_pending = True
+            return
         if not any(audio is not None for audio in self.audio_slots):
             return
+        if self.spec_freq_min_spin.value() >= self.spec_freq_max_spin.value():
+            return
+
         self.render_busy = True
+        self._render_pending = False
+        if self._manual_spec_range is None:
+            start_s = self.window_start_ms / 1000.0
+            width_s = self._spectrogram_span_ms() / 1000.0
+        else:
+            left, right = self._manual_spec_range
+            start_s, width_s = left, right - left
+        self._render_request_bounds = (start_s, start_s + width_s)
         job = ComputeJob(
             self.render_id, compute_spectrograms, tuple(self.audio_slots),
-            self.window_start_ms / 1000.0, self.VIEW_SECONDS,
-            self.ui.spin_n_fft.value(), self.ui.spin_hop_length.value()
+            start_s, width_s,
+            self.ui.spin_n_fft.value(), self.ui.spin_hop_length.value(),
+            self.spec_freq_min_spin.value() * 1000.0,
+            self.spec_freq_max_spin.value() * 1000.0,
+            self.spec_window_ms_spin.value()
         )
         job.signals.finished.connect(self._render_finished)
         self.pool.start(job)
@@ -1906,59 +3541,121 @@ class MainWindow(QMainWindow):
     def _render_finished(self, job_id, rendered, error):
         self.render_busy = False
         if job_id != self.render_id:
-            self.render_timer.start(0)  # 오직 가장 최신 시각의 그래프만 표시.
+            self.render_timer.start(0)
             return
         if error:
             self.statusBar().showMessage(f"STFT: {error}", 5000)
-            return
-        if not rendered or len(rendered) != len(self.spectrogram_views):
-            return
+        elif rendered and len(rendered) == len(self.spectrogram_views):
+            # Same STFT grids used for the current visible plot.
+            # Position call labels without an extra full-audio computation.
+            self._spectrogram_render_data = list(rendered)
+            low_db, high_db = self.spectrogram_levels_db
+            for index, entry in enumerate(rendered):
+                plot, image, playhead = self.spectrogram_views[index]
+                if entry is None or not entry[0].size:
+                    image.clear()
+                    continue
+                db, t, f = entry
+                image.setImage(
+                    db.T, autoLevels=False,
+                    levels=(float(low_db), float(high_db))
+                )
+                # Respect the actual FFT grid used in this render.
+                sr = self.audio_slots[index].sr
+                dt = t[1]-t[0] if len(t)>1 else 1.0/sr
+                df = f[1]-f[0] if len(f)>1 else sr/max(1, db.shape[0])
+                image.setRect(QRectF(
+                    float(t[0]-dt/2), float(f[0]-df/2),
+                    float(len(t)*dt), float(len(f)*df)
+                ))
+                playhead.setVisible(
+                    self.ui.slider_timeline_audio.maximum() > 0
+                )
+                playhead.setValue(self._audio_cursor_ms / 1000.0)
 
-        # 절대 동일한 로그레벨은 타임라인 위치와 마이크 채널에 무관하게 같은 색이다.
-        # 표시창마다 percentile로 범위를 새로 추정하지 않는다.
-        low, high = self.spectrogram_levels_db
+            # Always move the X-axis together with the rendered ImageItem,
+            # including during manual zoom + synchronized Video Play All.
+            if self.spectrogram_views:
+                first_plot = self.spectrogram_views[0][0]
+                left_s, right_s = self._render_request_bounds
+                if self._manual_freq_range is None:
+                    ylow = self.spec_freq_min_spin.value() * 1000.0
+                    yhigh = self.spec_freq_max_spin.value() * 1000.0
+                else:
+                    ylow, yhigh = self._manual_freq_range
+                self._setting_spectrogram_range = True
+                try:
+                    first_plot.setXRange(left_s, right_s, padding=0)
+                    first_plot.setYRange(ylow, yhigh, padding=0)
+                finally:
+                    self._setting_spectrogram_range = False
 
-        for index, entry in enumerate(rendered):
-            plot, image, playhead = self.spectrogram_views[index]
-            if entry is None or not entry[0].size:
-                image.clear()
-                continue
-            db, t, f = entry
-            image.setImage(db.T, autoLevels=False, levels=(float(low), float(high)))
-            sr = self.audio_slots[index].sr
-            hop = self.ui.spin_hop_length.value()
-            n_fft = self.ui.spin_n_fft.value()
-            dt = t[1] - t[0] if len(t) > 1 else hop / sr
-            df = f[1] - f[0] if len(f) > 1 else sr / n_fft
-            image.setRect(QRectF(t[0]-dt/2, f[0]-df/2, len(t)*dt, len(f)*df))
-            plot.setYRange(float(f[0]), float(f[-1]), padding=0)
-            # The spectrogram cursor is always the CURRENT audio slider time,
-            # regardless of preview mode or whether Sync markers are assigned.
-            # Rendering a new window must never hide or rewind the playhead.
-            playhead.setVisible(
-                self.ui.slider_timeline_audio.maximum() > 0
+            # Rolling playback changes x coordinates under a stationary mouse.
+            # Refresh labels from the same scene pixel without user mouse motion.
+            for index, position in enumerate(self.spec_hover_scene_positions):
+                if position is not None:
+                    self._on_spec_mouse_moved(index, QPointF(*position))
+
+            self.ui.lbl_time_audio.setText(
+                f"{self._format_ms(self._audio_cursor_ms)} / "
+                f"{self._format_ms(self.ui.slider_timeline_audio.maximum())}"
             )
-            playhead.setValue(self._audio_cursor_ms / 1000.0)
-
-        start_s = self.window_start_ms / 1000
-        if self.spectrogram_views:
-            self.spectrogram_views[0][0].setXRange(
-                start_s, start_s+self.VIEW_SECONDS, padding=0
-            )
-        # Rendering a new STFT window must never reset the PLAYHEAD clock.
-        self.ui.lbl_time_audio.setText(
-            f"{self._format_ms(self._audio_cursor_ms)} / "
-            f"{self._format_ms(self.ui.slider_timeline_audio.maximum())}"
-        )
-        self._refresh_result_overlay()
-        if getattr(self, "active_overlay_mode", None):
+            # Apply label boundaries only after the rolling X-axis has moved.
+            # Keep them independent from the assignment-result annotations.
+            self._refresh_label_boundaries()
             self._refresh_result_overlay()
+            self._sync_all_media_window()
+
+        # A slow worker can finish after playback has advanced.
+        # Present it, then render only the newest requested interval.
+        if self._render_pending:
+            self._render_pending = False
+            self.render_id += 1
+            self.render_timer.start(0)
+
+    def _check_video_length(self, path):
+        """Read native video FPS and, if available, check frame-count duration.
+
+        The returned FPS is used for SLEAP frame_idx -> video time conversion.
+        QMediaPlayer durationChanged independently enforces the 90-minute limit.
+        Constant-FPS timing may be inaccurate for variable-frame-rate videos.
+        """
+        import cv2
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            return None  # Qt가 읽을 수 있는 codec일 수 있으므로 계속 시도.
+        try:
+            actual_fps = float(capture.get(cv2.CAP_PROP_FPS))
+            frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        finally:
+            capture.release()
+        if not np.isfinite(actual_fps) or actual_fps <= 0:
+            return None
+        if np.isfinite(frames) and frames > 0:
+            duration_s = frames / actual_fps
+            if duration_s > self.MAX_MEDIA_DURATION_S + 0.05:
+                raise ValueError(
+                    f"Video duration {duration_s:.3f}s exceeds "
+                    "the supported 90-minute (5400s) limit."
+                )
+        return actual_fps
 
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Video", "", "Video (*.mp4 *.avi *.mov)"
         )
         if path:
+            try:
+                metadata_fps = self._check_video_length(path)
+            except ValueError as error:
+                QMessageBox.warning(self, "Video duration", str(error))
+                return
+            # The new video's FPS replaces the previous file's value.
+            self.video_fps = metadata_fps
+            self.video_fps_label.setText(
+                f"{metadata_fps:.3f} fps (auto)"
+                if metadata_fps is not None else "Unavailable"
+            )
             self._play_all_active = False
             self.player.stop()
             self.ui.line_video_path.setText(path)
@@ -1968,10 +3665,25 @@ class MainWindow(QMainWindow):
             self.ui.btn_play_all.setEnabled(True)
             self.btn_video_play.setEnabled(True)
             self._update_video_play_buttons()
+            if metadata_fps is None:
+                QMessageBox.warning(
+                    self, "Video FPS unavailable",
+                    "영상에서 FPS 메타데이터를 읽지 못했습니다. 영상 재생은 가능하지만 "
+                    "SLEAP tracking의 frame_idx를 시간으로 변환하지 않습니다. "
+                    "FPS 정보가 포함된 영상으로 다시 불러오세요."
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"Video FPS automatically detected: {metadata_fps:.3f} fps.",
+                    8000
+                )
             self.ui.tab_content.setCurrentWidget(self.ui.tab_video)
             # 다른 영상을 선택하면 기존 tracking/anchor가 맞지 않으므로 해제.
             self.tracking_df = None
+            self.tracking_path = None
+            self.tracking_csv_spec = None
             self.anchor_mapping = None
+            self._invalidate_video_dependent_results()
             self._update_audio_video_mapping_status()
             self.ui.line_tracking_file.clear()
 
@@ -2025,6 +3737,354 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "USV label header/import", str(error))
 
+    def _setup_superanimal_button(self):
+        """Expose pretrained DLC tracking directly in Test > Video Tracking.
+
+        Keep the SLEAP .slp/.csv Browse control and all Designer widgets.
+        If the optional settings regrouping was skipped, reconstruct only
+        the tracking group instead of crashing the whole application.
+        """
+        host = self.findChild(QGroupBox, "settings_group_video_tracking")
+        if host is None:
+            host = QGroupBox(
+                "Video Tracking (SLEAP / DeepLabCut)",
+                self.ui.tab_test_analyze,
+            )
+            host.setObjectName("settings_group_video_tracking")
+            host.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred,
+            )
+            layout = QGridLayout(host)
+            layout.setContentsMargins(8, 10, 8, 7)
+            layout.setColumnStretch(1, 1)
+            # These are the original SLEAP result-file widgets, not clones.
+            for column, widget in enumerate((
+                self.ui.lbl_tracking_file,
+                self.ui.line_tracking_file,
+                self.ui.lbl_tracking_browse,
+            )):
+                self.ui.gridLayout_2.removeWidget(widget)
+                layout.addWidget(widget, 0, column)
+            self.ui.verticalLayout_10.insertWidget(0, host)
+        else:
+            layout = host.layout()
+            if not isinstance(layout, QGridLayout):
+                raise RuntimeError(
+                    "Video Tracking group requires a QGridLayout."
+                )
+        host.setTitle("Video Tracking — SLEAP / DeepLabCut")
+        self.ui.lbl_tracking_file.setText("Tracking results")
+        self.ui.lbl_tracking_browse.setToolTip(
+            "Import an existing SLEAP .slp or a tracking CSV."
+        )
+        self.superanimal_button = QPushButton(
+            "▶ Run DeepLabCut SuperAnimal (auto setup)", host,
+        )
+        self.superanimal_button.setObjectName(
+            "btn_superanimal_tracking"
+        )
+        self.superanimal_button.setToolTip(
+            "Automatically download a private DeepLabCut environment on "
+            "first use, run pretrained TopViewMouse pose estimation on the "
+            "loaded video, and import the resulting tracking CSV."
+        )
+        self.superanimal_button.setMinimumHeight(34)
+        self.superanimal_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        layout.addWidget(self.superanimal_button, 1, 0, 1, 3)
+
+        self.superanimal_status = QLabel(
+            "DeepLabCut: TopViewMouse pretrained model. "
+            "Load a video, then click Run. Initial download needs internet.",
+            host,
+        )
+        self.superanimal_status.setObjectName("lbl_superanimal_status")
+        self.superanimal_status.setWordWrap(True)
+        self.superanimal_status.setToolTip(
+            "Status updates during Python/DeepLabCut setup, model inference "
+            "and automatic tracking CSV loading."
+        )
+        layout.addWidget(self.superanimal_status, 2, 0, 1, 3)
+
+        # A visual bar with REAL completed frames, not a fake percentage.
+        # During installation/download, Qt shows an indeterminate animation.
+        self.superanimal_progress = QProgressBar(host)
+        self.superanimal_progress.setObjectName("dlc_frame_progress")
+        self.superanimal_progress.setMinimumHeight(23)
+        self.superanimal_progress.setRange(0, 100)
+        self.superanimal_progress.setValue(0)
+        self.superanimal_progress.setFormat("Ready")
+        self.superanimal_progress.setTextVisible(True)
+        self.superanimal_progress.setStyleSheet("""
+            QProgressBar#dlc_frame_progress {
+                border: 1px solid #58717A;
+                border-radius: 5px;
+                background-color: #242B30;
+                color: #F3FAFF;
+                text-align: center;
+            }
+            QProgressBar#dlc_frame_progress::chunk {
+                background-color: #40C9DF;
+                border-radius: 4px;
+            }
+        """)
+        layout.addWidget(self.superanimal_progress, 3, 0, 1, 3)
+        self.superanimal_eta_label = QLabel(
+            "Elapsed: — | ETA: measured after frames begin", host
+        )
+        self.superanimal_eta_label.setObjectName("dlc_eta_label")
+        self.superanimal_eta_label.setWordWrap(True)
+        self.superanimal_eta_label.setToolTip(
+            "Estimated remaining time applies only to the current "
+            "measured video pass, excluding model download and CSV conversion."
+        )
+        layout.addWidget(self.superanimal_eta_label, 4, 0, 1, 3)
+
+        self._dlc_started_at = None
+        self._dlc_frame_state = None
+        self._dlc_remaining_seconds = None
+        self._dlc_elapsed_timer = QTimer(self)
+        self._dlc_elapsed_timer.setInterval(1000)
+        self._dlc_elapsed_timer.timeout.connect(
+            self._refresh_dlc_elapsed_and_eta
+        )
+        self.superanimal_button.clicked.connect(
+            self.start_superanimal_tracking
+        )
+        self._dlc_task = None
+        self._dlc_video_source = None
+
+
+    def start_superanimal_tracking(self, checked=False):
+        if not self.has_video:
+            QMessageBox.warning(
+                self, "Video required", "Load the tracking video first."
+            )
+            return
+        video = self.ui.line_video_path.text().strip()
+        if not Path(video).is_file():
+            QMessageBox.warning(
+                self, "Missing file", "Selected video no longer exists."
+            )
+            return
+        if self._dlc_task is not None:
+            QMessageBox.information(
+                self, "SuperAnimal", "Tracking is already running."
+            )
+            return
+
+        from video.dlc_track import is_superanimal_ready, runtime_root
+        if not is_superanimal_ready():
+            answer = QMessageBox.question(
+                self, "Automatic AI component setup",
+                "For first use, USVocAssigner will download Python 3.12, "
+                "DeepLabCut, and pretrained SuperAnimal model weights to your "
+                "user profile. No manual installation or administrator rights "
+                "are required.\n\n"
+                "Internet access, several GB of disk space, and potentially "
+                "substantial setup time are required.\n"
+                "Proceed with automatic setup?",
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        mice, accepted = QInputDialog.getInt(
+            self, "SuperAnimal", "Maximum animals in the video:",
+            2, 1, 30, 1,
+        )
+        if not accepted:
+            return
+
+        output_dir = str(runtime_root() / "results")
+        task = AutoDLCJob(video, output_dir, mice)
+        task.signals.progress.connect(self._on_superanimal_progress)
+        task.signals.finished.connect(self._on_superanimal_finished)
+        self._dlc_video_source = video
+        self._dlc_task = task
+        self._dlc_started_at = time.monotonic()
+        self._dlc_frame_state = None
+        self._dlc_remaining_seconds = None
+        self.superanimal_progress.setRange(0, 0)
+        self.superanimal_progress.setFormat("Preparing...")
+        self.superanimal_button.setEnabled(False)
+        self._dlc_elapsed_timer.start()
+        self._on_superanimal_progress(
+            {"kind": "stage",
+             "message": "Preparing pretrained SuperAnimal tracking..."}
+        )
+        self.pool.start(task)
+
+
+    def _refresh_dlc_elapsed_and_eta(self):
+        """Display measured elapsed time and conservative current-pass ETA."""
+        if self._dlc_started_at is None:
+            return
+        elapsed = max(0, int(time.monotonic() - self._dlc_started_at))
+        elapsed_label = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        eta_label = "estimating (waiting for real frame counts)"
+        if self._dlc_remaining_seconds is not None:
+            if (self._dlc_frame_state is not None and
+                    time.monotonic()
+                    - self._dlc_frame_state.get("last_update", 0) > 25):
+                eta_label = "updates paused; ETA unreliable"
+            else:
+                seconds = max(0, int(round(self._dlc_remaining_seconds)))
+                eta_label = (
+                    f"~{seconds // 60:d}m {seconds % 60:02d}s "
+                    "(current measured video pass only)"
+                )
+        self.superanimal_eta_label.setText(
+            f"Elapsed: {elapsed_label} | ETA: {eta_label}"
+        )
+
+
+    def _on_superanimal_progress(self, event):
+        """React to actual worker telemetry without creating fake progress."""
+        if isinstance(event, dict):
+            kind = event.get("kind")
+            if kind == "frames":
+                try:
+                    completed = int(event["completed"])
+                    total = int(event["total"])
+                    phase = int(event.get("pass_index", 1))
+                    if not (total > 0 and 0 <= completed <= total):
+                        return
+                except (ValueError, TypeError, KeyError):
+                    return
+                now = time.monotonic()
+                state = self._dlc_frame_state
+                if (state is None or phase != state.get("phase")
+                        or total != state.get("total")
+                        or completed < state.get("completed", 0)):
+                    state = {
+                        "phase": phase, "total": total,
+                        "base": completed, "started": now,
+                        "completed": completed, "last_update": now,
+                    }
+                    self._dlc_frame_state = state
+                    self._dlc_remaining_seconds = None
+                else:
+                    state["completed"] = completed
+                    state["last_update"] = now
+                    elapsed_pass = now - state["started"]
+                    advanced = completed - state["base"]
+                    # ETA derives from actually measured throughput only.
+                    if elapsed_pass >= 4 and advanced >= 5:
+                        fps = advanced / elapsed_pass
+                        self._dlc_remaining_seconds = (
+                            (total - completed) / fps if fps > 0 else None
+                        )
+                self.superanimal_progress.setRange(0, total)
+                self.superanimal_progress.setValue(completed)
+                self.superanimal_progress.setFormat(
+                    f"Video pass {phase}: %v/%m frames — %p%"
+                )
+                message = (
+                    f"DeepLabCut processing: pass {phase}, "
+                    f"{completed}/{total} frames "
+                    f"({100 * completed / total:.1f}%)"
+                )
+                self.superanimal_status.setText(message)
+                self.statusBar().showMessage(message)
+                self._refresh_dlc_elapsed_and_eta()
+                return
+            message = str(event.get("message", "DeepLabCut working..."))
+            if kind != "frames":
+                # Model download, inference setup, and CSV conversion do not
+                # have reliable frame percentages; use a busy animation.
+                self.superanimal_progress.setRange(0, 0)
+                self.superanimal_progress.setFormat(message)
+                self._dlc_frame_state = None
+                self._dlc_remaining_seconds = None
+        else:
+            message = str(event)
+            self.superanimal_progress.setRange(0, 0)
+            self.superanimal_progress.setFormat(message)
+            self._dlc_frame_state = None
+            self._dlc_remaining_seconds = None
+        self.superanimal_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_dlc_elapsed_and_eta()
+
+
+    def _on_superanimal_finished(self, csv_path, error):
+        self._dlc_elapsed_timer.stop()
+        source_video = self._dlc_video_source
+        self._dlc_video_source = None
+        self._dlc_task = None
+        self.superanimal_button.setEnabled(True)
+        if error:
+            self._on_superanimal_progress({"kind": "stage",
+                                           "message": "SuperAnimal: failed"})
+            self.superanimal_progress.setRange(0, 100)
+            self.superanimal_progress.setValue(0)
+            self.superanimal_progress.setFormat("Failed — see inference.log")
+            QMessageBox.critical(
+                self, "SuperAnimal error",
+                error + "\n\nRetry using the button. Installation/inference "
+                        "logs are saved in LocalAppData/USVocAssigner.",
+            )
+            return
+        if source_video != self.ui.line_video_path.text().strip():
+            self.superanimal_progress.setRange(0, 100)
+            self.superanimal_progress.setValue(0)
+            self.superanimal_progress.setFormat("Source video changed")
+            QMessageBox.warning(
+                self, "Video changed",
+                "Tracking was generated for an earlier video. "
+                "Please reload the correct video before importing.",
+            )
+            return
+        try:
+            self._on_superanimal_progress(
+                {"kind": "stage", "message": "Importing tracking CSV..."}
+            )
+            import cv2
+            capture = cv2.VideoCapture(source_video)
+            if not capture.isOpened():
+                raise RuntimeError("Cannot read FPS from source video.")
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+            capture.release()
+            if not (fps > 0):
+                raise RuntimeError("Missing or invalid video FPS.")
+
+            # DLC detection slots are NOT stable identities. The existing
+            # tracking pipeline stitches detections before manual anchor review.
+            raw = pd.read_csv(csv_path)
+            tracked = process_tracking_data(raw, fps)
+            self.tracking_df = tracked
+            self.tracking_path = csv_path
+            self.tracking_csv_spec = None
+            self.anchor_mapping = None
+            self._invalidate_results()
+            self._update_audio_video_mapping_status()
+            self.ui.line_tracking_file.setText(csv_path)
+            self.superanimal_progress.setRange(0, 100)
+            self.superanimal_progress.setValue(100)
+            self.superanimal_progress.setFormat("Completed — 100%")
+            if self._dlc_started_at is not None:
+                elapsed = round(time.monotonic() - self._dlc_started_at)
+                self.superanimal_eta_label.setText(
+                    f"Completed in {elapsed // 60:d}m {elapsed % 60:02d}s"
+                )
+            self.superanimal_status.setText(
+                f"SuperAnimal: {len(tracked)} tracking observations loaded."
+            )
+            self.statusBar().showMessage("DeepLabCut tracking imported", 8000)
+            self.review_anchor()
+        except Exception as exc:
+            self.superanimal_progress.setRange(0, 100)
+            self.superanimal_progress.setValue(0)
+            self.superanimal_progress.setFormat("CSV import failed")
+            QMessageBox.critical(
+                self, "SuperAnimal import error", str(exc),
+            )
+
     def open_tracking(self):
         """SLEAP instances CSV 또는 추적 결과 .slp를 읽어 좌표를 준비.
 
@@ -2034,6 +4094,13 @@ class MainWindow(QMainWindow):
         if not self.has_video:
             QMessageBox.warning(self, "Video required", "먼저 영상을 선택하세요.")
             return
+        if self.video_fps is None:
+            QMessageBox.warning(
+                self, "Video FPS unavailable",
+                "자동 FPS 판독에 실패한 영상에서는 SLEAP 추적 시간을 계산할 수 없습니다. "
+                "FPS 메타데이터가 있는 영상 파일을 불러오세요."
+            )
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "SLEAP tracking", "",
             "SLEAP results (*.slp *.csv);;SLP (*.slp);;CSV (*.csv);;All (*.*)"
@@ -2041,13 +4108,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            import cv2
             from video.track_run import load_tracking_table
-            cap = cv2.VideoCapture(self.ui.line_video_path.text())
-            if not cap.isOpened():
-                raise ValueError("Cannot read video FPS.")
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
+            fps = float(self.video_fps)  # detected automatically from loaded video
             csv_spec = None
             if Path(path).suffix.lower() == ".csv":
                 review = CSVHeaderDialog(path, kind="tracking", parent=self)
@@ -2062,7 +4124,7 @@ class MainWindow(QMainWindow):
             self.tracking_path = path
             self.tracking_csv_spec = csv_spec
             self.anchor_mapping = None
-            self._invalidate_results()
+            self._invalidate_video_dependent_results()
             self._update_audio_video_mapping_status()
             self.ui.line_tracking_file.setText(path)
             self.statusBar().showMessage(
@@ -2198,7 +4260,7 @@ class MainWindow(QMainWindow):
             mapping = save_anchor_mapping(track_to_mouse, mouse_to_channel)
             validate_audio_video_mapping(mapping, subjects)
             self.anchor_mapping = mapping
-            self._invalidate_results()
+            self._invalidate_video_dependent_results()
             self._update_audio_video_mapping_status()
             self.statusBar().showMessage(
                 f"Confirmed {len(mapping['track_to_mouse'])} Audio ↔ Video matches.",
@@ -2209,20 +4271,17 @@ class MainWindow(QMainWindow):
 
 
     def open_geometry(self):
-        """실측 위치·몸체 크기·경험적 모델 파라미터·학습된 경계를 JSON으로 읽음.
+        """Load measured geometry and empirical weights; no threshold CSV.
 
-        필수 JSON 예:
-        {
-          "mic_positions_m":{"ch1":[x1,y1],"ch2":[x2,y2]},
-          "pixel_to_meter_h":[[h00,h01,h02],[h10,h11,h12],[h20,h21,h22]],
-          "empirical":{"body_length_m":L,"body_width_m":W,
-                       "beta":1,"alpha_theta":1,"omega_min":0.3},
-          "threshold":{"r_mid":TRAIN_MEDIAN,"mad":TRAIN_MAD,"k":1}
-        }
-        예시 문자열 L/W/좌표/median은 실제 측정값으로 대체해야 한다.
+        Required geometry.json fields:
+          mic_positions_m, pixel_to_meter_h,
+          empirical: {body_length_m, body_width_m, ...}
+        The threshold is ALWAYS taken from the visible direct-input control.
+        A legacy "threshold" entry in JSON is intentionally ignored.
         """
         path, _ = QFileDialog.getOpenFileName(
-            self, "Validated geometry + threshold", "", "JSON (*.json)"
+            self, "Measured geometry (no training threshold needed)",
+            "", "JSON (*.json)"
         )
         if not path:
             return
@@ -2233,27 +4292,24 @@ class MainWindow(QMainWindow):
                 raise ValueError("mic_positions_m keys must match channel IDs.")
             with open(path, "r", encoding="utf-8") as handle:
                 obj = json.load(handle)
-            emp = None
-            threshold = None
-            if "empirical" in obj:
-                emp = EmpiricalGeoConfig(**obj["empirical"])
-            if "threshold" in obj:
-                threshold = EmpiricalThreshold(**obj["threshold"])
+            emp = EmpiricalGeoConfig(**obj["empirical"]) if "empirical" in obj else None
             self.geometry = geo
             self.empirical_cfg = emp
-            self.empirical_threshold = threshold
+            self.empirical_threshold = manual_empirical_threshold(
+                self.manual_ratio_threshold_spin.value()
+            )
             self.geometry_path = path
-            self._invalidate_results()
-            configured = bool(emp is not None and threshold is not None)
+            self._invalidate_video_dependent_results()
             self.label_geometry.setText(
                 f"Geometry: {Path(path).name} | empirical: "
-                f"{'ready' if configured else 'missing config/threshold'}"
+                f"{'ready' if emp is not None else 'missing parameters'} | "
+                f"manual T=±{self.manual_ratio_threshold_spin.value():.4f}"
             )
             self.statusBar().showMessage(
-                "Calibration loaded; validation quality is NOT established by parsing JSON.",
-                8000
+                "Geometry loaded. Manual threshold does not require training; "
+                "algorithm accuracy remains unvalidated.", 8000
             )
-        except Exception as error:
+        except (KeyError, TypeError, ValueError, OSError) as error:
             QMessageBox.critical(self, "Geometry", str(error))
 
     def _sync_is_ready(self):
@@ -2280,13 +4336,36 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     pass
             self.overlay_items = []
+        self._sync_all_media_window()
+
+    def _invalidate_video_dependent_results(self):
+        """Sync/Video changes invalidate corrected modes, not audio-only ratio.
+
+        Ratio-only assignments depend on WAV/labels/STFT parameters but not
+        SLEAP tracks, video FPS, geometry or synchronization anchors.
+        Preserve the ratio table and its Show on Graph badges in these cases.
+        """
+        self.analysis_generation += 1  # Cancel stale in-flight analyses.
+        self.analysis_results["distance"] = []
+        self.analysis_results["geometry"] = []
+        self.validation_metrics = {}
+        if hasattr(self, "validation_result"):
+            self.validation_result.setText("Validation: not performed")
+        self.ui.text_dist_result.clear()
+        self.ui.text_geo_result.clear()
+        self.results = list(self.analysis_results.get("ratio", []))
+        self.export_button.setEnabled(bool(self.results))
+        if getattr(self, "active_overlay_mode", None) != "ratio":
+            self.active_overlay_mode = None
+        self._refresh_result_overlay()
+        self._sync_all_media_window()
 
     def _clear_sync_starts(self):
         """새 미디어 입력 시 고정 시작점을 해제하고 offset을 초기화한다."""
         self.audio_start_s = None
         self.video_start_s = None
         self.sync = SyncConfig()
-        self._invalidate_results()
+        self._invalidate_video_dependent_results()
         if hasattr(self, "audio_anchor_lines"):
             for line in self.audio_anchor_lines:
                 line.setVisible(False)
@@ -2311,6 +4390,15 @@ class MainWindow(QMainWindow):
         v = "—" if self.video_start_s is None else f"{self.video_start_s:.3f}s"
         self.audio_start_label.setText(f"A: {a}")
         self.video_start_label.setText(f"V: {v}")
+        # Slider Sync 버튼, Reset, JSON 복원도 수동 필드에 동일하게 반영.
+        # 사용자가 값만 입력했을 때는 Apply 전까지 Sync를 바꾸지 않는다.
+        if hasattr(self, "manual_audio_onset_spin"):
+            for spin, anchor in (
+                (self.manual_audio_onset_spin, self.audio_start_s),
+                (self.manual_video_onset_spin, self.video_start_s),
+            ):
+                with QSignalBlocker(spin):
+                    spin.setValue(0.0 if anchor is None else float(anchor))
         # 사용자 탐색과 무관한 별도 고정 마커: 변경/초기화 시에만 좌표 갱신.
         self.audio_slider_marker.set_marker_ms(
             None if self.audio_start_s is None else self.audio_start_s * 1000
@@ -2344,7 +4432,7 @@ class MainWindow(QMainWindow):
 
     def _recalculate_sync_from_anchors(self):
         """두 기준점을 동일 사건으로 놓고 offset을 산출; 이후에도 고정 유지."""
-        self._invalidate_results()
+        self._invalidate_video_dependent_results()
         if self._sync_is_ready():
             self.sync = sync_from_start_points(self.audio_start_s, self.video_start_s)
         else:
@@ -2364,6 +4452,48 @@ class MainWindow(QMainWindow):
                 f"시간축 정렬 완료: Audio={self.audio_start_s:.3f}s, "
                 f"Video={self.video_start_s:.3f}s, offset={self.sync.offset_s:+.3f}s", 7000
             )
+
+    def apply_manual_sync(self):
+        """두 매체의 동일한 사건의 onset 시간을 직접 입력해 Sync 수행."""
+        if not self.audio_slots or any(audio is None for audio in self.audio_slots):
+            QMessageBox.warning(
+                self, "Manual Sync", "모든 Audio WAV/CSV 채널을 먼저 불러오세요."
+            )
+            return
+        if not self.has_video:
+            QMessageBox.warning(self, "Manual Sync", "Video 파일을 먼저 불러오세요.")
+            return
+
+        audio_onset = float(self.manual_audio_onset_spin.value())
+        video_onset = float(self.manual_video_onset_spin.value())
+        audio_duration = min(audio.duration_s for audio in self.audio_slots)
+        video_duration = max(
+            int(self.video_duration_ms), int(self.player.duration())
+        ) / 1000.0
+        if video_duration <= 0:
+            QMessageBox.warning(
+                self, "Manual Sync",
+                "Video duration을 아직 읽지 못했습니다. 영상 로드 후 다시 시도하세요."
+            )
+            return
+        if not (0 <= audio_onset <= min(audio_duration, self.MAX_MEDIA_DURATION_S)):
+            QMessageBox.warning(
+                self, "Manual Sync",
+                f"Audio onset은 모든 채널의 실제 길이({audio_duration:.3f}s) 안이어야 합니다."
+            )
+            return
+        if not (0 <= video_onset <= min(video_duration, self.MAX_MEDIA_DURATION_S)):
+            QMessageBox.warning(
+                self, "Manual Sync",
+                f"Video onset은 실제 영상 길이({video_duration:.3f}s) 안이어야 합니다."
+            )
+            return
+
+        # 기존 Sync 버튼과 동일한 단일 상태/시간 변환 파이프라인 사용.
+        # 영상 FPS는 SLEAP 좌표 timestamp에만 적용하고 여기서 초로 변환하지 않음.
+        self.audio_start_s = audio_onset
+        self.video_start_s = video_onset
+        self._recalculate_sync_from_anchors()
 
     def mark_audio_start(self):
         """Audio Sync: 현재 슬라이더 시각을 고정하고 초록색 세로 마커로 표시."""
@@ -2474,7 +4604,8 @@ class MainWindow(QMainWindow):
             self.analysis_generation, run_assignment,
             tuple(self.audio_slots), tuple(self.events),
             None, None, None, None,
-            self.ui.spin_n_fft.value(), self.ui.spin_hop_length.value()
+            self.ui.spin_n_fft.value(), self.ui.spin_hop_length.value(),
+            self.ratio_only_margin_spin.value(),
         )
         job.signals.finished.connect(self._analysis_finished)
         self.pool.start(job)
@@ -2574,6 +4705,93 @@ class MainWindow(QMainWindow):
     def _on_audio_channel_selected(self, _index):
         """마이크를 바꾸면 이전 채널의 재생 사본은 폐기한다."""
         self._stop_audio_preview()
+
+    @staticmethod
+    def _parse_seek_time_ms(value):
+        """Parse seconds, mm:ss.mmm, or hh:mm:ss.mmm into integer ms."""
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Enter a time: e.g. 35.25 or 01:35.250.")
+        parts = text.split(":")
+        try:
+            if len(parts) == 1:
+                total_s = float(parts[0])
+            elif len(parts) == 2:
+                minutes = int(parts[0])
+                seconds = float(parts[1])
+                if minutes < 0 or not (0 <= seconds < 60):
+                    raise ValueError("Minutes/seconds out of range.")
+                total_s = 60 * minutes + seconds
+            elif len(parts) == 3:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = float(parts[2])
+                if hours < 0 or not (0 <= minutes < 60) or not (0 <= seconds < 60):
+                    raise ValueError("Hours/minutes/seconds out of range.")
+                total_s = 3600 * hours + 60 * minutes + seconds
+            else:
+                raise ValueError("Use seconds, mm:ss.mmm or hh:mm:ss.mmm.")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "Invalid timestamp. Use 35.25, 01:35.250 or 01:02:03.456."
+            ) from exc
+        if not np.isfinite(total_s) or total_s < 0:
+            raise ValueError("Timestamp must be finite and nonnegative.")
+        return int(round(total_s * 1000))
+
+
+    def _seek_audio_from_text(self):
+        """Seek the original audio timeline; resume an active preview at target."""
+        try:
+            if not any(a is not None for a in self.audio_slots):
+                raise ValueError("Load an audio file first.")
+            target_ms = self._parse_seek_time_ms(self.audio_seek_edit.text())
+            max_ms = self.ui.slider_timeline_audio.maximum()
+            if not 0 <= target_ms <= max_ms:
+                raise ValueError(
+                    f"Audio timestamp exceeds recording length "
+                    f"({self._format_ms(max_ms)})."
+                )
+            was_playing = (
+                self._audio_preview_active
+                and self.audio_preview_player.playbackState()
+                == QMediaPlayer.PlaybackState.PlayingState
+            )
+            if self._audio_preview_active:
+                self._stop_audio_preview()
+            with QSignalBlocker(self.ui.slider_timeline_audio):
+                self.ui.slider_timeline_audio.setValue(target_ms)
+            # This also moves video ONLY during enabled Play All sync mode.
+            self._on_audio_timeline_seek(target_ms)
+            if was_playing and target_ms < max_ms:
+                self._start_audio_preview_at(target_ms / 1000.0)
+            self.audio_seek_edit.setText(self._format_ms(target_ms))
+            self.audio_seek_edit.clearFocus()
+        except (ValueError, OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Audio seek", str(exc))
+            self.audio_seek_edit.setFocus()
+
+
+    def _seek_video_from_text(self):
+        """Seek real video playback directly, retaining play/pause and Sync."""
+        try:
+            if not self.has_video or self.video_duration_ms <= 0:
+                raise ValueError("Load a video with known duration first.")
+            target_ms = self._parse_seek_time_ms(self.video_seek_edit.text())
+            if target_ms > self.video_duration_ms:
+                raise ValueError(
+                    "Video timestamp exceeds duration "
+                    f"({self._format_ms(self.video_duration_ms)})."
+                )
+            self.player.setPosition(target_ms)
+            # Update visible labels even if the backend dispatches later.
+            self.video_position(target_ms)
+            self.video_seek_edit.setText(self._format_ms(target_ms))
+            self.video_seek_edit.clearFocus()
+        except (ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Video seek", str(exc))
+            self.video_seek_edit.setFocus()
+
 
     def _on_audio_timeline_seek(self, position_ms):
         """User seeks ORIGINAL seconds; linked mode also seeks VIDEO time."""
@@ -2823,7 +5041,12 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
-        """재생 종료 시 Qt 미디어 핸들과 임시 가청 미리듣기 파일을 정리한다."""
+        """Cancel long-running MP4 export before closing the media viewer."""
+        if self.export_cancel is not None:
+            self.export_cancel.set()
+        if self._all_media_window is not None:
+            self._all_media_window.close()
+            self._all_media_window = None
         self._audio_preview_active = False
         self.audio_preview_player.stop()
         self.audio_preview_player.setSource(QUrl())
@@ -2958,8 +5181,14 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_ms(value_ms):
-        seconds = max(0, int(value_ms) // 1000)
-        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+        """재생 시각: 1시간 이상은 hh:mm:ss.mmm, 그 전에는 mm:ss.mmm."""
+        total_ms = max(0, int(round(value_ms)))
+        hours, remainder = divmod(total_ms, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        seconds, milliseconds = divmod(remainder, 1_000)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+        return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
     def _on_video_playback_error(self, error, message):
         """Expose Qt codec/metadata problems instead of a stationary slider."""
@@ -2969,8 +5198,34 @@ class MainWindow(QMainWindow):
             )
 
     def _on_video_duration(self, duration_ms):
-        """Video/Play All slider ranges use milliseconds and the real media duration."""
-        self.video_duration_ms = max(0, int(duration_ms))
+        """1시간 30분까지의 영상에 대해 video/common slider를 ms 단위로 설정."""
+        duration_ms = max(0, int(duration_ms))
+        if duration_ms > self.MAX_MEDIA_DURATION_MS:
+            # Qt가 metadata를 늦게 읽는 경우에도 입력 제한을 강제한다.
+            self.player.stop()
+            with QSignalBlocker(self.player):
+                self.player.setSource(QUrl())
+            self.has_video = False
+            self.video_fps = None
+            self.video_fps_label.setText("— (no video)")
+            self.video_duration_ms = 0
+            self.ui.line_video_path.clear()
+            self.ui.line_tracking_file.clear()
+            self.tracking_path = None
+            self.tracking_df = None
+            self.tracking_csv_spec = None
+            self.anchor_mapping = None
+            self.ui.btn_play_all.setEnabled(False)
+            self.btn_video_play.setEnabled(False)
+            self._update_audio_video_mapping_status()
+            self._clear_sync_starts()
+            self._update_video_play_buttons()
+            QMessageBox.warning(
+                self, "Video duration",
+                "Video file exceeds the 90-minute (5400 s) supported limit."
+            )
+            return
+        self.video_duration_ms = duration_ms
         position_ms = max(0, int(self.player.position()))
         with QSignalBlocker(self.ui.slider_timeline_video):
             self.ui.slider_timeline_video.setRange(0, self.video_duration_ms)
@@ -3002,10 +5257,14 @@ class MainWindow(QMainWindow):
         self.ui.lbl_time_video.setText(
             f"{self._format_ms(position_ms)} / {self._format_ms(self.video_duration_ms)}"
         )
+        if (hasattr(self, "video_seek_edit")
+            and not self.video_seek_edit.hasFocus()):
+            self.video_seek_edit.setText(self._format_ms(position_ms))
         self.ui.label_time_all.setText(
             f"{self._format_ms(common_elapsed)} / "
             f"{self._format_ms(end_ms-start_ms)}"
         )
+        self._refresh_all_media_cursor()
         # 영상 단독 재생은 전체 비디오 끝까지 허용한다. 양 매체 중 먼저
         # 종료하는 공통 구간 제한은 하단 Play All 모드에서만 적용.
         if (self._play_all_active and self._sync_is_ready()
@@ -3039,8 +5298,8 @@ class MainWindow(QMainWindow):
     def run_test_analysis(self, mode):
         """Test 탭의 distance/geometry 모델. 원본 ratio-only 결과와 별도 저장.
 
-        대상은 A/B 두 개체 실험이며 현재 geometry JSON, validation threshold,
-        두 Sync marker, SLEAP 좌표, Anchor subject ID가 필수다.
+        대상은 A/B 두 개체 실험이며 geometry JSON, 직접 입력한 |R_corr|
+        임계값, 두 Sync marker, 영상 좌표, Anchor subject ID가 필요하다.
         """
         if self.analysis_busy:
             return
@@ -3051,13 +5310,15 @@ class MainWindow(QMainWindow):
             or not all(self.label_paths)):
             missing.append("N channel-specific USV label files")
         if self.tracking_df is None:
-            missing.append("SLEAP tracking CSV/.slp")
+            missing.append("SLEAP or DeepLabCut tracking results")
         if not self.anchor_mapping:
             missing.append("confirmed Audio ↔ Video subject/track association")
         if not self._sync_is_ready():
             missing.append("both Audio/Video Sync markers")
-        if not self.geometry or not self.empirical_cfg or not self.empirical_threshold:
-            missing.append("measured geometry + trained median/MAD JSON")
+        if not self.geometry or not self.empirical_cfg:
+            missing.append("measured geometry + empirical parameters")
+        if self.empirical_threshold is None:
+            missing.append("manual corrected log-ratio threshold")
         if missing:
             QMessageBox.warning(self, "Experimental model", "Required: " + ", ".join(missing))
             return
@@ -3081,62 +5342,96 @@ class MainWindow(QMainWindow):
             self.anchor_mapping, self.geometry, self.empirical_cfg,
             self.empirical_threshold, subjects, self.sync,
             mode == "distance",
-            self.ui.spin_n_fft.value(), self.ui.spin_hop_length.value()
+            self.ui.spin_n_fft.value(), self.ui.spin_hop_length.value(),
+            self.ratio_only_margin_spin.value(),
         )
         job.signals.finished.connect(self._analysis_finished)
         self.pool.start(job)
 
     def show_result_overlay(self, mode):
-        """현재 보이는 전체 마이크 스펙트로그램에 onset/offset별 ID 주석 표시."""
-        if not self.analysis_results.get(mode):
-            QMessageBox.information(self, "Assignment labels", "먼저 해당 분석을 실행하세요.")
+        """Overlay result labels in the visible Audio tab, not a stale 500-ms window.
+
+        When idle and no call is visible, navigate to the first assigned event
+        without resetting the selected display span or changing model outputs.
+        """
+        results = self.analysis_results.get(mode) or []
+        if not results:
+            QMessageBox.information(
+                self, "Assignment labels", "먼저 해당 분석을 실행하세요."
+            )
             return
         self.active_overlay_mode = mode
-        self._refresh_result_overlay()
         self.ui.tab_content.setCurrentWidget(self.ui.tab_audio)
 
-    def fit_training_threshold(self):
-        """선택된 training 파일의 R_corr열로 R_mid/비보정 MAD 학습.
-
-        이 training CSV는 현재 empirical geometry 설정(단위·가중치 모드)에
-        맞춰 이미 계산된 R_corr값이어야 한다. Validation CSV와 절대 중복 금지.
-        이 버튼은 검증 정확도를 측정하지 않고 임계값만 업데이트한다.
-        """
-        from voc_assign.ratio_corr import fit_empirical_threshold
-        if self.empirical_cfg is None:
-            QMessageBox.warning(self, "Training", "먼저 empirical 설정이 포함된 geometry.json을 불러오세요.")
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Training corrected ratios (R_corr)", "", "CSV (*.csv)"
-        )
-        if not path:
-            return
-        try:
-            review = CSVHeaderDialog(path, kind="training", parent=self)
-            if review.exec() != QDialog.DialogCode.Accepted:
-                return
-            dataframe = read_delimited_table(path, review.result_spec)
-            if "r_corr" not in dataframe.columns:
-                raise ValueError("Training CSV must contain r_corr column (natural-log ratio).")
-            values = pd.to_numeric(dataframe["r_corr"], errors="raise").to_numpy()
-            learned = fit_empirical_threshold(values, k=self.empirical_cfg.k)
-            self.empirical_threshold = learned
-            self.training_path = str(path)
-            self._invalidate_results()
-            QMessageBox.information(
-                self, "Training complete",
-                f"R_mid={learned.r_mid:.5f}, MAD={learned.mad:.5f}, "
-                f"k={learned.k:g}.\nKeep the validation dataset separate."
+        if self.spectrogram_views:
+            left, right = self.spectrogram_views[0][0].viewRange()[0]
+            has_visible_call = any(
+                result.event.offset_s >= left and result.event.onset_s <= right
+                for result in results
             )
-        except Exception as error:
-            QMessageBox.critical(self, "Training error", str(error))
+            if not has_visible_call and not (
+                self._play_all_active or self._audio_preview_active
+            ):
+                first = min(results, key=lambda r: r.event.onset_s)
+                event_mid_s = (first.event.onset_s + first.event.offset_s) / 2
+                mid_ms = round(event_mid_s * 1000)
+                span_ms = (
+                    round((self._manual_spec_range[1]
+                           - self._manual_spec_range[0]) * 1000)
+                    if self._manual_spec_range is not None
+                    else self._spectrogram_span_ms()
+                )
+                span_ms = max(5, span_ms)
+                duration_ms = self.ui.slider_timeline_audio.maximum()
+                target_start_ms = min(
+                    max(0, duration_ms-span_ms),
+                    max(0, mid_ms-span_ms//2)
+                )
+                if self._manual_spec_range is not None:
+                    self._manual_spec_range = (
+                        target_start_ms / 1000.0,
+                        (target_start_ms+span_ms) / 1000.0
+                    )
+                else:
+                    self.window_start_ms = target_start_ms
+                # Move audio playhead without changing video/audio playback state.
+                with QSignalBlocker(self.ui.slider_timeline_audio):
+                    self.ui.slider_timeline_audio.setValue(mid_ms)
+                self.draw_audio(mid_ms, force=True)
+                self.statusBar().showMessage(
+                    f"Show on Graph: 첫 번째 USV {first.event.onset_s:.3f}s "
+                    f"위치로 이동 ({mode})", 6000
+                )
+        # Once the Audio tab is visible its ViewBox has correct pixel geometry.
+        # STFT render completion will reapply badges on later playback frames.
+        QTimer.singleShot(
+            0, lambda: (
+                self._refresh_result_overlay(), self._sync_all_media_window()
+            )
+        )
+
+    def set_manual_ratio_threshold(self, value):
+        """Update direct decision half-width without reading a training file.
+
+        The user supplies T in NATURAL-LOG corrected-ratio units. The center
+        stays at zero, irrespective of class frequency / earlier sessions.
+        """
+        self.empirical_threshold = manual_empirical_threshold(float(value))
+        self.training_path = None
+        self._invalidate_video_dependent_results()
+        self.statusBar().showMessage(
+            f"Manual |R_corr| threshold ±{float(value):.4f} (center = 0); "
+            "distance/angle results need rerun.",
+            5000,
+        )
+
 
     def validate_results(self):
-        """학습에 사용하지 않은 정답 CSV로 ratio/distance/geometry를 정량 비교.
+        """Compare the audio-only baseline and corrected modes to ground truth.
 
-        정답 형식: onset_s,offset_s,mouse_id. 각 결과 USV onset/offset과
-        5ms 이내에 일치하는 정답 행에 한하여 계산하고 매칭 수를 보고한다.
-        기준 데이터를 임계값 학습에 재사용하면 과대평가되므로 금지.
+        Input: onset_s,offset_s,mouse_id. Match USV boundaries within 5ms.
+        A manually chosen threshold requires no training file, but any
+        threshold tuning on these labels still demands independent holdout.
         """
         from voc_assign.ratio_corr import validate_empirical_predictions
         if not any(self.analysis_results.values()):
@@ -3201,124 +5496,535 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Validation error", str(error))
 
+    def _refresh_label_boundaries(self):
+        """Draw independent onset/offset markers for each channel's input labels.
+
+        These are NOT assignment results and remain visible without running an
+        analysis. Plot in WAV absolute seconds; mark only boundaries inside
+        each visible X range. Reuse cached sorted intervals to support 90-min
+        label files without scanning every event during scrolling.
+        """
+        for plot, item in getattr(self, "label_boundary_items", []):
+            try:
+                plot.removeItem(item)
+            except RuntimeError:
+                pass
+        self.label_boundary_items = []
+
+        if not self.spectrogram_views:
+            return
+
+        label_sources = getattr(self, "label_events", []) or []
+        source_signature = tuple(
+            (id(channel_events), len(channel_events))
+            for channel_events in label_sources
+        )
+        if (source_signature != getattr(
+                self, "_label_boundary_index_signature", None
+            )
+            or len(self._label_boundary_index) != len(label_sources)):
+            # prefix_max_end is monotone and allows finding even intervals
+            # that started long before the current viewport but overlap it.
+            built = []
+            for channel_events in label_sources:
+                intervals = sorted(
+                    (
+                        (float(event.onset_s), float(event.offset_s))
+                        for event in channel_events
+                    ),
+                    key=lambda interval: interval[0]
+                )
+                starts = [interval[0] for interval in intervals]
+                prefix_max_end = []
+                largest_end = float("-inf")
+                for _, end in intervals:
+                    largest_end = max(largest_end, end)
+                    prefix_max_end.append(largest_end)
+                built.append((intervals, starts, prefix_max_end))
+            self._label_boundary_index = built
+            self._label_boundary_index_signature = source_signature
+
+        onset_pen = pg.mkPen("#B8EE88", width=1.6, style=Qt.PenStyle.SolidLine)
+        offset_pen = pg.mkPen("#FF86B2", width=1.6, style=Qt.PenStyle.DashLine)
+
+        for channel, (plot, _, _) in enumerate(self.spectrogram_views):
+            if (channel >= len(self._label_boundary_index)
+                or channel >= len(self.label_paths)
+                or not self.label_paths[channel]):
+                continue
+
+            visible_left, visible_right = plot.viewRange()[0]
+            if (not np.isfinite([visible_left, visible_right]).all()
+                or visible_right <= visible_left):
+                continue
+
+            intervals, starts, prefix_max_end = self._label_boundary_index[channel]
+            first = bisect_left(prefix_max_end, visible_left)
+            last = bisect_right(starts, visible_right)
+            for onset_s, offset_s in intervals[first:last]:
+                if offset_s < visible_left:
+                    continue
+                for x_seconds, pen in ((onset_s, onset_pen), (offset_s, offset_pen)):
+                    # The plot clips offscreen ends; avoid creating those items.
+                    if not visible_left <= x_seconds <= visible_right:
+                        continue
+                    marker = pg.InfiniteLine(
+                        pos=x_seconds, angle=90, pen=pen, movable=False
+                    )
+                    marker.setZValue(40)  # Below Sync/playhead & ID labels.
+                    marker.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    marker.setAcceptHoverEvents(False)
+                    plot.addItem(marker, ignoreBounds=True)
+                    self.label_boundary_items.append((plot, marker))
+
     def _refresh_result_overlay(self):
-        """STFT를 재계산하지 않고 기존 그래프의 TextItem만 변경."""
+        """Show each assignment ID over its USV in the actual visible time range.
+
+        Uses the currently plotted ViewBox (including manual zoom, changed time
+        span and rolling synchronized playback), not stale window_start_ms or
+        VIEW_SECONDS. If labels have no fmin/fmax, locate the most prominent
+        time/frequency cell during the annotated event in the existing STFT.
+        """
         for plot, item in self.overlay_items:
             try:
                 plot.removeItem(item)
             except RuntimeError:
-                pass  # 새 그래프가 이전 PlotWidget을 이미 파괴한 경우.
+                pass
         self.overlay_items = []
-        results = self.analysis_results.get(getattr(self, "active_overlay_mode", ""), [])
-        if not results:
+
+        mode = getattr(self, "active_overlay_mode", None)
+        results = self.analysis_results.get(mode, []) if mode else []
+        if not results or not self.spectrogram_views:
             return
-        starts = self.window_start_ms / 1000
-        ends = starts + self.VIEW_SECONDS
-        subjects = self.channel_subjects()
-        for result in results:
-            event = result.event
-            if event.offset_s < starts or event.onset_s > ends:
+
+        # All N spectrograms share the same X-axis through PyQtGraph.setXLink.
+        x_left, x_right = self.spectrogram_views[0][0].viewRange()[0]
+        if not np.isfinite([x_left, x_right]).all() or x_right <= x_left:
+            return
+        # Iterate only USV calls in the currently displayed window.
+        visible_calls = [
+            row for row in results
+            if row.event.offset_s >= x_left and row.event.onset_s <= x_right
+        ]
+        if not visible_calls:
+            return
+
+        channel_subjects = self.channel_subjects()
+        for channel, (plot, image, _) in enumerate(self.spectrogram_views):
+            low_y, high_y = plot.viewRange()[1]
+            if not np.isfinite([low_y, high_y]).all() or high_y <= low_y:
                 continue
-            # Geometry/Distance가 'unassigned'라고 판정한 경우 baseline 채널명으로
-            # 대체하지 않는다. 그래프의 표기와 결과 CSV가 일치해야 한다.
-            if result.method == "ratio-only":
-                text_id = subjects.get(result.channel_id, "unassigned")
-            else:
-                text_id = result.mouse_id or "unassigned"
-            for plot, _, _ in self.spectrogram_views:
-                # fmax 위 7px 위치에 표기. Hz/pixel은 확대 비율/창 크기마다 다르므로
-                # 현재 ViewBox 높이를 기준으로 매번 계산해 5~10px 요구를 유지.
-                # Frequency column이 없다면 화면 상단에서 약 12px 아래에 배치.
-                low_y, high_y = plot.viewRange()[1]
-                vb_height_px = max(float(plot.plotItem.vb.height()), 1.0)
-                hz_per_px = max((high_y - low_y) / vb_height_px, 1e-9)
-                if getattr(event, "fmax_hz", None) is not None:
-                    label_y = min(float(event.fmax_hz) + 7 * hz_per_px,
-                                  high_y - 5 * hz_per_px)
-                    label_y = max(low_y + 5 * hz_per_px, label_y)
+
+            viewbox = plot.getViewBox()
+            px_height = max(float(viewbox.height()), 1.0)
+            px_width = max(float(viewbox.width()), 1.0)
+            hz_per_px = (high_y-low_y)/px_height
+            s_per_px = (x_right-x_left)/px_width
+            cached = (
+                self._spectrogram_render_data[channel]
+                if channel < len(self._spectrogram_render_data) else None
+            )
+
+            for result in visible_calls:
+                event = result.event
+                # Ratio-only channels are identified by Subject ID mapping.
+                # Corrected assignments must use mouse_id directly, and never
+                # fall back to baseline when a result was rejected.
+                if result.method == "ratio-only":
+                    name = channel_subjects.get(result.channel_id) or "unassigned"
                 else:
-                    label_y = high_y - 12 * hz_per_px
-                item = pg.TextItem(text=str(text_id), color="#FFFADC",
-                                   anchor=(0, 1), fill=pg.mkBrush(18, 30, 39, 225))
-                item.setPos(max(starts, event.onset_s), label_y)
-                item.setZValue(100)
-                plot.addItem(item)
+                    name = result.mouse_id or "unassigned"
+
+                event_low = getattr(event, "fmin_hz", None)
+                event_high = getattr(event, "fmax_hz", None)
+                center_s = 0.5 * (float(event.onset_s)+float(event.offset_s))
+                # Prefer the actual spectral ridge when no explicit frequency
+                # range is supplied in the source USV label CSV/TXT.
+                ridge_hz = None
+                if cached is not None and len(cached) == 3:
+                    db, times, freqs = cached
+                    if (getattr(db, "ndim", 0) == 2
+                        and len(times) == db.shape[1]
+                        and len(freqs) == db.shape[0]):
+                        t_indices = np.flatnonzero(
+                            (times >= max(event.onset_s, x_left))
+                            & (times <= min(event.offset_s, x_right))
+                        )
+                        if t_indices.size == 0 and len(times):
+                            nearest = int(np.argmin(np.abs(times-center_s)))
+                            if abs(float(times[nearest])-center_s) <= max(
+                                0.001, (event.offset_s-event.onset_s)
+                            ):
+                                t_indices = np.array([nearest])
+                        f_low = max(float(low_y), 0.0)
+                        f_high = float(high_y)
+                        if event_low is not None and event_high is not None:
+                            f_low = max(f_low, float(event_low))
+                            f_high = min(f_high, float(event_high))
+                        elif f_high > 18000.0:
+                            # Prefer USV energy rather than low-frequency
+                            # recording noise when no frequency band was labeled.
+                            f_low = max(f_low, 18000.0)
+                        f_indices = np.flatnonzero(
+                            (freqs >= f_low) & (freqs <= f_high)
+                        )
+                        if t_indices.size and f_indices.size:
+                            patch_db = db[np.ix_(f_indices, t_indices)]
+                            finite = np.isfinite(patch_db)
+                            if finite.any():
+                                best = int(np.argmax(
+                                    np.where(finite, patch_db, -np.inf)
+                                ))
+                                row_idx, col_idx = np.unravel_index(
+                                    best, patch_db.shape
+                                )
+                                ridge_hz = float(freqs[f_indices[row_idx]])
+
+                if event_high is not None and low_y <= float(event_high) <= high_y:
+                    target_hz = float(event_high)
+                elif ridge_hz is not None:
+                    target_hz = ridge_hz
+                elif event_low is not None and event_high is not None:
+                    # A frequency-labeled call may be outside the selected
+                    # frequency viewport; don't mislabel unrelated noise.
+                    if event_high < low_y or event_low > high_y:
+                        continue
+                    target_hz = min(float(event_high), high_y)
+                else:
+                    # No frequency labels or ridge available yet (e.g., the
+                    # STFT worker is running): keep the badge visible up top.
+                    target_hz = high_y - 25.0*hz_per_px
+
+                # TextItem(anchor=(0.5,1)) places the text bottom at this point.
+                # Leave 9 screen pixels between call and label; stay in frame.
+                label_hz = float(np.clip(
+                    target_hz + 9.0*hz_per_px,
+                    low_y + 24.0*hz_per_px,
+                    high_y - 8.0*hz_per_px
+                ))
+                label_time = float(np.clip(
+                    center_s,
+                    x_left + 37.0*s_per_px,
+                    x_right - 37.0*s_per_px
+                ))
+                item = pg.TextItem(
+                    text=str(name),
+                    color="#FFFADC" if name != "unassigned" else "#C2CAD0",
+                    anchor=(0.5, 1),
+                    fill=pg.mkBrush(18, 30, 39, 230),
+                    border=pg.mkPen("#A0B5BD", width=0.8)
+                )
+                item.setZValue(150)
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                item.setAcceptHoverEvents(False)
+                item.setPos(label_time, label_hz)
+                plot.addItem(item, ignoreBounds=True)
                 self.overlay_items.append((plot, item))
 
     def save_pdf(self):
-        """현재 화면에 plot된 모든 N채널 스펙트로그램+분석 표를 한 PDF로 저장.
-
-        '현재까지 plot된 이미지'는 현재 보이는 3초 구간의 각 채널 그래프를 뜻한다.
-        5분 전체 STFT를 고해상도로 한 번에 PDF로 저장하면 메모리가 매우
-        커질 수 있으므로 전체 타임라인 출력은 별도 배치 기능으로 구분한다.
-        """
+        """Export chooser: current on-screen PDF OR full-audio rolling MP4."""
         if not self.spectrogram_views or not any(self.audio_slots):
-            QMessageBox.information(self, "PDF", "먼저 WAV와 스펙트로그램을 로드하세요.")
+            QMessageBox.information(
+                self, "Export", "먼저 오디오와 스펙트로그램을 불러오세요."
+            )
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export plots and assignments", "USVocAssigner_report.pdf",
-            "PDF (*.pdf)"
+        if self.export_running:
+            QMessageBox.information(
+                self, "Export", "이미 MP4를 생성 중입니다."
+            )
+            return
+        path, file_filter = QFileDialog.getSaveFileName(
+            self, "Export current PDF or full-audio MP4",
+            "USVocAssigner_export.pdf",
+            "PDF report (*.pdf);;MP4 movie (*.mp4)"
         )
         if not path:
             return
+        suffix = Path(path).suffix.lower()
+        if suffix not in (".pdf", ".mp4"):
+            suffix = ".mp4" if "MP4" in file_filter else ".pdf"
+            path += suffix
+        if suffix == ".mp4":
+            self._start_full_audio_mp4_export(path)
+        else:
+            self._save_visible_media_pdf(path)
+
+    def _save_visible_media_pdf(self, path):
+        """Only the actual visible X-axis interval and current video frame.
+
+        Do NOT append full-session assignment tables or the rest of the WAV.
+        Grab the current plot widgets so their existing USV boundaries,
+        assignment IDs, axis zoom, and color palette are preserved.
+        """
         try:
+            start_s, end_s = self.spectrogram_views[0][0].viewRange()[0]
+            if not (np.isfinite([start_s, end_s]).all()
+                    and end_s > start_s):
+                raise ValueError("현재 스펙트로그램 X축 범위가 잘못되었습니다.")
+            video_image = QImage()
+            if self.has_video:
+                frame = self.video_widget.videoSink().videoFrame()
+                if frame.isValid():
+                    video_image = frame.toImage()
+                if video_image.isNull():
+                    # Some backends don't retain a paused QVideoSink frame.
+                    import cv2
+                    cap = cv2.VideoCapture(
+                        self.ui.line_video_path.text().strip()
+                    )
+                    if cap.isOpened():
+                        try:
+                            cap.set(
+                                cv2.CAP_PROP_POS_MSEC,
+                                float(self.player.position())
+                            )
+                            valid, bgr = cap.read()
+                            if valid:
+                                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                                rh, rw = rgb.shape[:2]
+                                video_image = QImage(
+                                    rgb.data, rw, rh, rw*3,
+                                    QImage.Format.Format_RGB888
+                                ).copy()
+                        finally:
+                            cap.release()
+
             pdf = QPdfWriter(path)
             pdf.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
             pdf.setResolution(150)
             painter = QPainter(pdf)
             if not painter.isActive():
-                raise RuntimeError("Unable to initialize PDF writer.")
+                raise RuntimeError("PDF writer could not be opened.")
             try:
-                page_w, page_h = pdf.width(), pdf.height()
-                left, top, bottom = 85, 85, 75
-                y = top
-                font = QFont("Malgun Gothic", 11)
-                painter.setFont(font)
+                page_width, page_height = pdf.width(), pdf.height()
+                margin = 85
+                y = margin
+                bottom = margin
+                painter.setFont(QFont("Malgun Gothic", 11))
                 painter.setPen(QColor("#121B24"))
-                painter.drawText(left, y, "USVocAssigner — spectrogram & assignment report")
-                y += 55
-                painter.drawText(left, y, "Current window: "
-                    + f"{self.window_start_ms/1000:.3f}s, "
-                    + f"scale={self.spectrogram_levels_db} dB rel.")
-                y += 35
 
-                def next_page_if_needed(height):
+                def room(required):
                     nonlocal y
-                    if y + height > page_h - bottom:
+                    if y + required > page_height-bottom:
                         pdf.newPage()
-                        y = top
+                        y = margin
 
+                def draw_fitted(image, max_height):
+                    nonlocal y
+                    if image.isNull():
+                        return
+                    draw_width = page_width-2*margin
+                    draw_height = min(
+                        max_height,
+                        round(draw_width*image.height()/max(1,image.width()))
+                    )
+                    draw_width = min(
+                        draw_width,
+                        round(draw_height*image.width()/max(1,image.height()))
+                    )
+                    room(draw_height+20)
+                    painter.drawImage(
+                        QRectF(margin,y,draw_width,draw_height),image
+                    )
+                    y += draw_height+30
+
+                painter.drawText(
+                    margin,y,"USVocAssigner | Current Visible Media"
+                )
+                y += 45
+                painter.drawText(
+                    margin,y,
+                    f"Audio window: {start_s:.3f} - {end_s:.3f} s"
+                )
+                y += 36
+                if self.has_video:
+                    painter.drawText(
+                        margin,y,
+                        f"Video frame at {self.player.position()/1000:.3f} s"
+                    )
+                    y += 31
+                    if not video_image.isNull():
+                        draw_fitted(video_image, 480)
+                    else:
+                        painter.drawText(
+                            margin,y,"Video frame not available."
+                        )
+                        y += 30
+                else:
+                    painter.drawText(margin,y,"No video loaded.")
+                    y += 30
                 for index, (plot, _, _) in enumerate(self.spectrogram_views):
+                    if index >= len(self.audio_slots):
+                        break
                     if self.audio_slots[index] is None:
                         continue
-                    image = plot.grab().toImage()  # GUI thread: capture this channel's plot
-                    if image.isNull():
+                    # Even if another tab is active, QWidget.grab() paints the
+                    # current PlotWidget without extending its time range.
+                    shot = plot.grab().toImage()
+                    if shot.isNull():
                         continue
-                    width = page_w - 2*left
-                    height = int(width*image.height()/max(image.width(), 1))
-                    next_page_if_needed(height + 40)
-                    painter.drawText(left, y, f"ch{index+1}: "
-                                     + self.subject_fields[index].text().strip())
-                    y += 20
-                    painter.drawImage(QRectF(left, y, width, height), image)
-                    y += height + 35
-
-                for mode, result in self.analysis_results.items():
-                    if not result:
-                        continue
-                    next_page_if_needed(70)
-                    painter.drawText(left, y, f"{mode.upper()} — {len(result)} events")
-                    y += 32
-                    for line in self._results_csv_text(result).splitlines():
-                        next_page_if_needed(24)
-                        # 긴 reason 필드는 한 줄에서 잘라 PDF 바깥으로 넘치지 않게 함.
-                        painter.drawText(left, y, line[:125])
-                        y += 24
+                    room(70)
+                    painter.drawText(margin,y,f"CH {index+1}")
+                    y += 23
+                    draw_fitted(shot, 540)
             finally:
                 painter.end()
-            self.statusBar().showMessage(f"Report saved: {path}", 7000)
+            self.statusBar().showMessage(
+                f"Current-range PDF exported: {path}", 8000
+            )
         except Exception as error:
-            QMessageBox.critical(self, "PDF export", str(error))
+            QMessageBox.critical(self, "PDF Export", str(error))
+
+    def _start_full_audio_mp4_export(self, path):
+        """Export 0..full WAV duration, not the visible plot/video duration."""
+        if not self.has_video or not self.ui.line_video_path.text().strip():
+            QMessageBox.warning(
+                self, "MP4 Export",
+                "영상과 오디오를 함께 MP4로 저장하려면 Video를 불러오세요."
+            )
+            return
+        if not self._sync_is_ready():
+            QMessageBox.warning(
+                self, "MP4 Export",
+                "Audio/Video onset 동기화를 먼저 설정하세요. "
+                "동기화 없이 두 매체를 같은 시간축에 합칠 수 없습니다."
+            )
+            return
+        if self.video_fps is None or self.video_fps <= 0:
+            QMessageBox.warning(
+                self, "MP4 Export",
+                "영상 FPS를 판독하지 못했습니다."
+            )
+            return
+        if not self.audio_slots or any(a is None for a in self.audio_slots):
+            QMessageBox.warning(
+                self, "MP4 Export", "모든 오디오 채널을 불러오세요."
+            )
+            return
+
+        durations = [float(a.duration_s) for a in self.audio_slots]
+        duration_s = min(durations)  # All channels must have valid samples.
+        if duration_s <= 0 or duration_s > self.MAX_MEDIA_DURATION_S:
+            QMessageBox.warning(
+                self, "MP4 Export", "오디오 길이는 0~90분이어야 합니다."
+            )
+            return
+        if max(durations)-min(durations)>0.05:
+            msg = (
+                "오디오 채널들의 길이가 서로 다릅니다. 현재 프로그램의 "
+                "공통 분석 기준에 맞춰 가장 짧은 채널의 끝까지 "
+                f"({duration_s:.3f} s) MP4를 만듭니다. 계속할까요?"
+            )
+            if QMessageBox.question(
+                self,"MP4 duration",msg,
+                QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        video_dur = self.video_duration_ms/1000.0
+        # Video may end early. Keep the entire audio duration and explicitly
+        # show NO CORRESPONDING VIDEO for times outside the mapped interval.
+        output_fps = min(30, max(1, int(round(self.video_fps))))
+        confirmation = (
+            f"전체 오디오 {duration_s:.3f}초 ({duration_s/60:.1f}분)를 "
+            f"{output_fps} fps MP4로 출력합니다.\n"
+            "스크린샷이 아니라 오디오 전 구간을 순차적으로 STFT 분석해 "
+            "동영상과 함께 저장합니다. 영상에 대응하지 않는 시각은 "
+            "빈 화면으로 표시합니다.\n"
+            "녹음 길이에 따라 수십 분 이상 걸리고 파일이 클 수 있습니다. "
+            "초음파 사운드트랙은 포함하지 않습니다. 계속할까요?"
+        )
+        if QMessageBox.question(
+            self, "Export Full-Audio MP4", confirmation,
+            QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        # Snapshot all GUI-owned settings before launching the worker.
+        intervals = [
+            sorted(
+                (float(ev.onset_s),float(ev.offset_s))
+                for ev in self.label_events[index]
+            ) if index < len(self.label_events) else []
+            for index in range(len(self.audio_slots))
+        ]
+        subjects = self.channel_subjects()
+        results = self.analysis_results.get(
+            self.active_overlay_mode, []
+        ) if self.active_overlay_mode else []
+        annotations = sorted(
+            (
+                float(row.event.onset_s),float(row.event.offset_s),
+                subjects.get(row.channel_id, "unassigned")
+                if row.method == "ratio-only"
+                else row.mouse_id or "unassigned"
+            ) for row in results
+        )
+        span_s = self._spectrogram_span_ms()/1000.0
+        if self._manual_spec_range is not None:
+            span_s = max(
+                .005,
+                self._manual_spec_range[1]-self._manual_spec_range[0]
+            )
+        # Streaming 90min of 20-ms panels requires too many STFT tile changes.
+        # Let the user keep a narrow GUI zoom, but impose a practical 0.1s
+        # minimum only for the encoded MP4 tile width.
+        span_s = max(.100,min(10.0,float(span_s)))
+        args = (
+            str(path),str(self.ui.line_video_path.text().strip()),
+            tuple(self.audio_slots),intervals,annotations,
+            float(self.sync.offset_s),float(self.video_fps),
+            float(video_dur),float(duration_s),float(span_s),
+            float(self.spec_freq_min_spin.value())*1000,
+            float(self.spec_freq_max_spin.value())*1000,
+            float(self.spec_window_ms_spin.value()),
+            int(self.ui.spin_hop_length.value()),
+            self.spectrogram_lut.copy(),
+            tuple(self.spectrogram_levels_db),
+            int(output_fps)
+        )
+        self.export_cancel = threading.Event()
+        self.export_job = ExportJob(
+            export_combined_mp4, args, self.export_cancel
+        )
+        self.export_progress_dialog = QProgressDialog(
+            "전체 오디오 MP4를 생성하고 있습니다...", "Cancel",
+            0,100,self
+        )
+        self.export_progress_dialog.setWindowTitle("Export MP4")
+        self.export_progress_dialog.setMinimumDuration(0)
+        self.export_progress_dialog.setValue(0)
+        self.export_progress_dialog.canceled.connect(
+            self.export_cancel.set
+        )
+        self.export_job.signals.progress.connect(
+            self.export_progress_dialog.setValue
+        )
+        self.export_job.signals.finished.connect(
+            self._full_audio_mp4_finished
+        )
+        self.export_running = True
+        self.ui.btn_save_pdf.setEnabled(False)
+        self.pool.start(self.export_job)
+
+    def _full_audio_mp4_finished(self, path, error):
+        self.export_running = False
+        self.ui.btn_save_pdf.setEnabled(True)
+        if self.export_progress_dialog is not None:
+            self.export_progress_dialog.close()
+            self.export_progress_dialog.deleteLater()
+            self.export_progress_dialog = None
+        self.export_job = None
+        self.export_cancel = None
+        if error:
+            if "canceled" in error.lower():
+                self.statusBar().showMessage("MP4 export canceled.",8000)
+            else:
+                QMessageBox.critical(self,"MP4 Export",error)
+            return
+        self.statusBar().showMessage(
+            f"Full-audio MP4 exported: {path}",15000
+        )
+
 
     def save_process(self):
         """세션을 .usvoc.json으로 저장 (오디오/영상 원본은 별도 파일로 보존).
@@ -3340,7 +6046,9 @@ class MainWindow(QMainWindow):
                 {"path": str(audio.path) if audio is not None else None,
                  "sr": audio.sr if audio is not None else None,
                  "csv_spec": self.audio_csv_specs[i],
-                 "subject_id": self.subject_fields[i].text().strip()}
+                 "subject_id": self.subject_fields[i].text().strip(),
+                 "gain_db": float(audio.gain_db) if audio is not None else 0.0,
+                 "response_csv": audio.response_path if audio is not None else None}
                 for i, audio in enumerate(self.audio_slots)
             ],
             "video": self.ui.line_video_path.text().strip() or None,
@@ -3353,8 +6061,11 @@ class MainWindow(QMainWindow):
             "tracking": self.tracking_path,
             "tracking_csv_spec": self.tracking_csv_spec,
             "geometry": getattr(self, "geometry_path", None),
-            # Fit median/MAD from training R_corr may override threshold in geometry.json.
-            "training_path": self.training_path,
+            # User-selected zero-centered natural-log ratio threshold.
+            # Keep the legacy object key for old readers, but no training file.
+            "training_path": None,
+            "ratio_only_margin_db": self.ratio_only_margin_spin.value(),
+            "manual_ratio_threshold_log": self.manual_ratio_threshold_spin.value(),
             "empirical_threshold": (
                 asdict(self.empirical_threshold)
                 if self.empirical_threshold is not None else None
@@ -3362,8 +6073,22 @@ class MainWindow(QMainWindow):
             "anchor_mapping": self.anchor_mapping,
             "audio_start_s": self.audio_start_s,
             "video_start_s": self.video_start_s,
+            "video_fps": self.video_fps,  # Auditing only; detect afresh on restore.
             "n_fft": self.ui.spin_n_fft.value(),
             "hop_length": self.ui.spin_hop_length.value(),
+            "calibration_gain_enabled": self.calibration_gain_checkbox.isChecked(),
+            "calibration_response_enabled": self.calibration_response_checkbox.isChecked(),
+            "calibration_reference_ch": self.calibration_reference_channel.currentData(),
+            "calibration_interval_s": [
+                self.calibration_start_s.value(), self.calibration_end_s.value()
+            ],
+            "calibration_band_khz": [
+                self.calibration_low_khz.value(), self.calibration_high_khz.value()
+            ],
+            "spec_time_span_ms": self.spec_time_span_spin.value(),
+            "spec_fmin_khz": self.spec_freq_min_spin.value(),
+            "spec_fmax_khz": self.spec_freq_max_spin.value(),
+            "spec_window_ms": self.spec_window_ms_spin.value(),
             "view_start_ms": self.window_start_ms,
             "color_levels_db": list(self.spectrogram_levels_db),
             "results": {
@@ -3400,6 +6125,16 @@ class MainWindow(QMainWindow):
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if payload.get("format") != "USVocAssigner-session" or payload.get("version") != 1:
                 raise ValueError("Unsupported session file/version.")
+            # Missing in legacy sessions: we cannot know what historical
+            # decision threshold produced their saved assignment results.
+            has_ratio_only_margin = "ratio_only_margin_db" in payload
+            ratio_only_margin = float(payload.get("ratio_only_margin_db", 0.1))
+            if not np.isfinite(ratio_only_margin) or not (
+                0.0 <= ratio_only_margin <= 60.0
+            ):
+                raise ValueError(
+                    "Saved ratio-only margin must be finite within 0..60 dB."
+                )
             audio_rows = payload.get("audio", [])
             if len(audio_rows) < 2 or len(audio_rows) > 16:
                 raise ValueError("Session needs 2~16 audio channels.")
@@ -3416,11 +6151,12 @@ class MainWindow(QMainWindow):
                 for _ in range(len(audio_rows)-len(label_rows_saved))
             ]
             paths = [row.get("path") for row in audio_rows]
+            response_files = [row.get("response_csv") for row in audio_rows]
             label_files = [row.get("path") for row in label_rows_saved]
             other_paths = [
                 payload.get(key) for key in ("video", "tracking", "geometry")
             ]
-            for source in paths + label_files + other_paths:
+            for source in paths + response_files + label_files + other_paths:
                 if source and not Path(source).is_file():
                     raise FileNotFoundError(f"Referenced file not found: {source}")
             # Legacy sessions may not contain reviewed CSV-header mappings.
@@ -3442,6 +6178,21 @@ class MainWindow(QMainWindow):
                 for i, row in enumerate(audio_rows)
             ]
             self._validate_slots(candidate)
+            # Restore calibration metadata before STFT/ratio features are run.
+            # Re-open measured CSV curves; do not rely on stale arrays in JSON.
+            for index, (audio, saved) in enumerate(zip(candidate, audio_rows)):
+                if audio is None:
+                    continue
+                gain = float(saved.get("gain_db", 0.0))
+                if not np.isfinite(gain) or abs(gain) > 60:
+                    raise ValueError(f"CH {index+1}: saved gain must be within ±60 dB.")
+                audio.gain_db = gain
+                response_file = saved.get("response_csv")
+                if response_file:
+                    freq, response = load_frequency_response_csv(response_file)
+                    audio.response_path = str(response_file)
+                    audio.response_freq_hz = freq
+                    audio.response_db = response
             saved_hop = int(payload.get("hop_length", 512))
             candidate_labels = []
             for i, entry in enumerate(label_rows_saved):
@@ -3482,15 +6233,94 @@ class MainWindow(QMainWindow):
                 self.subject_fields[index].setText(row.get("subject_id", f"mouse_{index+1}"))
             self._apply_audio_update()
 
-            self.ui.spin_n_fft.setValue(int(payload.get("n_fft", 2048)))
-            self.ui.spin_hop_length.setValue(int(payload.get("hop_length", 512)))
-            levels = payload.get("color_levels_db", [-100, 0])
+            # Restore calibration checkboxes without triggering partial re-renders.
+            use_gain = bool(payload.get("calibration_gain_enabled", False))
+            use_response = bool(payload.get("calibration_response_enabled", False))
+            if use_response and any(
+                a is not None and a.response_freq_hz is None
+                for a in self.audio_slots
+            ):
+                raise ValueError(
+                    "Saved response calibration is enabled but one or more "
+                    "microphone response CSV files are missing."
+                )
+            for checkbox, flag in (
+                (self.calibration_gain_checkbox, use_gain),
+                (self.calibration_response_checkbox, use_response)
+            ):
+                with QSignalBlocker(checkbox):
+                    checkbox.setChecked(flag)
+            ref_ch = payload.get("calibration_reference_ch")
+            if isinstance(ref_ch, int) and 0 <= ref_ch < len(self.audio_slots):
+                self.calibration_reference_channel.setCurrentIndex(ref_ch)
+            interval = payload.get("calibration_interval_s", [0.0, 1.0])
+            band = payload.get("calibration_band_khz", [35.0, 100.0])
+            if (len(interval) == 2 and len(band) == 2
+                and 0 <= float(interval[0]) < float(interval[1]) <= 5400
+                and 0 < float(band[0]) < float(band[1]) <= 500):
+                for spin, setting in (
+                    (self.calibration_start_s, interval[0]),
+                    (self.calibration_end_s, interval[1]),
+                    (self.calibration_low_khz, band[0]),
+                    (self.calibration_high_khz, band[1])
+                ):
+                    with QSignalBlocker(spin):
+                        spin.setValue(float(setting))
+            self._on_calibration_changed()
+
+            self.ui.spin_n_fft.setValue(int(payload.get("n_fft", 512)))
+            self.ui.spin_hop_length.setValue(
+                int(payload.get("hop_length", self._last_auto_hop_length))
+            )
+            with QSignalBlocker(self.ratio_only_margin_spin):
+                self.ratio_only_margin_spin.setValue(ratio_only_margin)
+            # Session v1 backward compatibility: old sessions use 500 ms / 0–150 kHz.
+            restored_span = int(payload.get("spec_time_span_ms", 500))
+            restored_fmin = float(payload.get("spec_fmin_khz", 0.0))
+            restored_fmax = float(payload.get("spec_fmax_khz", 150.0))
+            restored_window = float(payload.get("spec_window_ms", 4.096))
+            if not (10 <= restored_span <= 10000):
+                raise ValueError("Saved spectrogram time span is invalid.")
+            if not (0 <= restored_fmin < restored_fmax <= 500):
+                raise ValueError("Saved spectrogram frequency range is invalid.")
+            if not (0.5 <= restored_window <= 20.0):
+                raise ValueError("Saved display STFT window is invalid.")
+            for spin, setting in (
+                (self.spec_time_span_spin, restored_span),
+                (self.spec_freq_min_spin, restored_fmin),
+                (self.spec_freq_max_spin, restored_fmax),
+                (self.spec_window_ms_spin, restored_window),
+            ):
+                with QSignalBlocker(spin):
+                    spin.setValue(setting)
+            self._manual_spec_range = None
+            self._manual_freq_range = None
+            levels = payload.get("color_levels_db", [-110, -35])
             if len(levels) == 2 and float(levels[0]) < float(levels[1]):
                 self.color_min_spin.setValue(float(levels[0]))
                 self.color_max_spin.setValue(float(levels[1]))
 
+            # A saved FPS is never used for synchronization or frame timestamps.
+            # Re-read the actual media, including when restoring an old session.
+            saved_fps = payload.get("video_fps")
+            self.video_fps = None
+            self.video_fps_label.setText("— (load video)")
+            fps_changed = False
             video = payload.get("video")
             if video:
+                self.video_fps = self._check_video_length(video)
+                self.video_fps_label.setText(
+                    f"{self.video_fps:.3f} fps (auto)"
+                    if self.video_fps is not None else "Unavailable"
+                )
+                if saved_fps is not None and self.video_fps is not None:
+                    try:
+                        fps_changed = (
+                            not np.isfinite(float(saved_fps))
+                            or abs(float(saved_fps) - self.video_fps) > 0.001
+                        )
+                    except (TypeError, ValueError):
+                        fps_changed = True
                 self.ui.line_video_path.setText(video)
                 self.player.setSource(QUrl.fromLocalFile(video))
                 self.has_video = True
@@ -3503,10 +6333,12 @@ class MainWindow(QMainWindow):
             self.tracking_path = payload.get("tracking")
             self.tracking_csv_spec = payload.get("tracking_csv_spec")
             if self.tracking_path:
-                import cv2
-                capture = cv2.VideoCapture(video)
-                fps = capture.get(cv2.CAP_PROP_FPS)
-                capture.release()
+                if self.video_fps is None:
+                    raise ValueError(
+                        "Video FPS could not be detected. Saved SLEAP tracking "
+                        "timestamps cannot be reconstructed safely."
+                    )
+                fps = float(self.video_fps)
                 if Path(self.tracking_path).suffix.lower() == ".csv":
                     if self.tracking_csv_spec is None:
                         dlg = CSVHeaderDialog(
@@ -3531,23 +6363,43 @@ class MainWindow(QMainWindow):
             # Display invalid state; empirical analysis will reject it.
             self._update_audio_video_mapping_status()
             self.geometry_path = payload.get("geometry")
-            self.training_path = payload.get("training_path")
+            # Manual decision thresholds never require a prior training path.
+            self.training_path = None
             self.geometry = None
             self.empirical_cfg = None
-            self.empirical_threshold = None
             if self.geometry_path:
                 self.geometry = load_geometry_json(self.geometry_path)
-                settings = json.loads(Path(self.geometry_path).read_text(encoding="utf-8"))
+                settings = json.loads(
+                    Path(self.geometry_path).read_text(encoding="utf-8")
+                )
                 if "empirical" in settings:
-                    self.empirical_cfg = EmpiricalGeoConfig(**settings["empirical"])
-                if "threshold" in settings:
-                    self.empirical_threshold = EmpiricalThreshold(**settings["threshold"])
-                self.label_geometry.setText(f"Geometry: {Path(self.geometry_path).name}")
+                    self.empirical_cfg = EmpiricalGeoConfig(
+                        **settings["empirical"]
+                    )
+                # Ignore legacy fitted JSON "threshold": the user asked
+                # for zero-centered direct input, not a learned median.
+                self.label_geometry.setText(
+                    f"Geometry: {Path(self.geometry_path).name}"
+                )
 
-            # 저장 당시 training CSV로 새로 학습한 경계가 있다면 복원한다.
-            learned = payload.get("empirical_threshold")
-            if learned is not None:
-                self.empirical_threshold = EmpiricalThreshold(**learned)
+            # Prefer explicit GUI threshold in new sessions. Old sessions
+            # with fitted median/MAD are NOT silently loaded as manual values.
+            has_manual_threshold = "manual_ratio_threshold_log" in payload
+            old_boundary = payload.get("empirical_threshold") or {}
+            manual_value = payload.get(
+                "manual_ratio_threshold_log",
+                old_boundary.get("manual_margin", 0.5),
+            )
+            if manual_value is None:
+                manual_value = 0.5
+            manual_value = float(manual_value)
+            if not np.isfinite(manual_value) or not 0 <= manual_value <= 100:
+                raise ValueError(
+                    "Saved manual log-ratio threshold is out of range 0..100."
+                )
+            with QSignalBlocker(self.manual_ratio_threshold_spin):
+                self.manual_ratio_threshold_spin.setValue(manual_value)
+            self.empirical_threshold = manual_empirical_threshold(manual_value)
             self.audio_start_s = payload.get("audio_start_s")
             self.video_start_s = payload.get("video_start_s")
             self._recalculate_sync_from_anchors()
@@ -3565,8 +6417,25 @@ class MainWindow(QMainWindow):
                     }
                 return AssignmentResult(**rec)
 
-            for mode, records in payload.get("results", {}).items():
+            if fps_changed:
+                self.statusBar().showMessage(
+                    "Video FPS differs from the saved session. "
+                    "Saved analysis results were discarded; run analysis again.",
+                    12000
+                )
+            for mode, records in (
+                {} if fps_changed else payload.get("results", {})
+            ).items():
                 if mode not in self.analysis_results:
+                    continue
+                # Earlier saved results do not record their ratio-only dB
+                # margin. Discard rather than silently attributing them
+                # to the current input value; ask user to rerun analysis.
+                if not has_ratio_only_margin:
+                    continue
+                # Legacy fitted boundaries are incompatible with new
+                # zero-centered direct-input rules. Recompute corrected modes.
+                if mode in ("distance", "geometry") and not has_manual_threshold:
                     continue
                 self.analysis_results[mode] = [restore_result(rec) for rec in records]
             self.ui.text_result.setPlainText(

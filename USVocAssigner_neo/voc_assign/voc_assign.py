@@ -25,7 +25,7 @@ class AssignmentResult:
     candidate_errors_db: dict = field(default_factory=dict)
 
 
-def ratio_only_assignment(audio_dataset, events, min_margin_db=0.03,
+def ratio_only_assignment(audio_dataset, events, min_margin_db=0.1,
                           n_fft=1024, hop_length=256,
                           recording_bias_db=None):
     """채널별 동일 시간 구간의 상대 레벨을 비교하는 기준 알고리즘."""
@@ -150,9 +150,22 @@ def geometry_assignment(baseline_results, tracking_df, anchor_mapping,
 
 def run_assignment(audio_dataset, events, tracking_df=None, anchor_mapping=None,
                    geometry=None, sync=None, n_fft=1024, hop_length=256,
-                   min_ratio_margin_db=0.03):
+                   min_ratio_margin_db=0.1):
     """일관된 파이프라인: baseline -> (선택적) geometry 최종 판정."""
     bias = geometry.recording_bias_db if geometry is not None else None
+    # Both this legacy recording_bias_db and GUI channel gains describe
+    # recording-channel calibration; applying nonzero values of both would
+    # double compensate the same channel amplitude mismatch.
+    if (bias and any(abs(float(v)) > 1e-8 for v in bias.values())
+        and any(
+            getattr(a, "apply_gain", False)
+            and abs(float(getattr(a, "gain_db", 0.0))) > 1e-8
+            for a in audio_dataset
+        )):
+        raise ValueError(
+            "Conflicting amplitude calibration: disable GUI gain offsets "
+            "or remove recording_bias_db from geometry.json."
+        )
     baseline = ratio_only_assignment(
         audio_dataset, events, min_margin_db=min_ratio_margin_db,
         n_fft=n_fft, hop_length=hop_length, recording_bias_db=bias
@@ -218,8 +231,8 @@ def empirical_ratio_assignment(baseline_results, tracking_df, anchor_mapping,
     """Apply the Notion-defined R_amp/omega_geo empirical model.
 
     Requires two channels with an explicit subject mapping, stable track IDs,
-    a measured pixel-to-meter transform, two correct anchors, and a
-    threshold learned on training data. No invented threshold is used.
+    a measured pixel-to-meter transform, two correct anchors, and an
+    explicitly configured decision margin. No training CSV is necessary.
     """
     if len(channel_subjects) != 2:
         raise ValueError("Empirical A/B decision requires exactly TWO channels.")
@@ -277,7 +290,9 @@ def empirical_ratio_assignment(baseline_results, tracking_df, anchor_mapping,
             baseline, method=method, mouse_id=mouse,
             reason=(f"R_corr={r_corr:+.4f} log-unit; "
                     f"{weighting}; omega_safe={weights['omega_safe']:.3f}; "
-                    f"R_mid={threshold.r_mid:+.3f} MAD={threshold.mad:.3f}; "
+                    f"center={threshold.r_mid:+.3f} log; "
+                    f"half_width={threshold.half_width:.4f} log; "
+                    f"threshold_source={'manual' if threshold.manual_margin is not None else 'legacy-fit'}; "
                     f"{'assigned' if mouse else 'unassigned'}"),
             candidate_errors_db={**baseline.candidate_errors_db,
                                  "R_corr_log": r_corr,
@@ -291,22 +306,34 @@ def empirical_ratio_assignment(baseline_results, tracking_df, anchor_mapping,
 def run_empirical_assignment(audio_dataset, events, tracking_df, anchor_mapping,
                              geometry, empirical, threshold, channel_subjects,
                              sync=None, distance_only=False,
-                             n_fft=1024, hop_length=256):
+                             n_fft=1024, hop_length=256,
+                             min_ratio_margin_db=0.1):
     """GUI test tab calls this after checking all required measured inputs."""
     channels = {a.channel_id for a in audio_dataset}
     if channels != set(channel_subjects) or len(channels) != 2:
         raise ValueError("Exactly two mapped audio channels are required.")
     if geometry is None or empirical is None or threshold is None:
-        raise ValueError("Measured geometry and fitted threshold JSON required.")
+        raise ValueError("Measured geometry, empirical parameters, and a manual log-ratio threshold required.")
     if tracking_df is None or anchor_mapping is None or sync is None:
         raise ValueError("Tracking, anchor IDs and synchronized start points required.")
     # Explicit association is a scientific input, not inferred from track order.
     # Reject old or stale mappings even when this function is called without GUI.
     from video.track_anchor import validate_audio_video_mapping
     validate_audio_video_mapping(anchor_mapping, channel_subjects)
+    bias = geometry.recording_bias_db
+    if (bias and any(abs(float(v)) > 1e-8 for v in bias.values())
+        and any(
+            getattr(a, "apply_gain", False)
+            and abs(float(getattr(a, "gain_db", 0.0))) > 1e-8
+            for a in audio_dataset
+        )):
+        raise ValueError(
+            "Conflicting amplitude calibration: disable GUI gain offsets "
+            "or remove recording_bias_db from geometry.json."
+        )
     baseline = ratio_only_assignment(
         audio_dataset, events, n_fft=n_fft, hop_length=hop_length,
-        recording_bias_db=geometry.recording_bias_db
+        recording_bias_db=bias, min_margin_db=min_ratio_margin_db
     )
     return empirical_ratio_assignment(
         baseline, tracking_df, anchor_mapping, sync, geometry,

@@ -3,6 +3,13 @@
 # Fusion 스타일을 사용하면 Windows 버전에 따른 기본 위젯 색상 차이를 줄인다.
 import sys
 from pathlib import Path
+
+# Visual Studio에서 executor/main.py를 직접 실행하더라도
+# 프로젝트 루트의 ui/, audio/, video/, voc_assign/를 찾도록 설정한다.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from PySide6.QtWidgets import QApplication
 from ui.controller import MainWindow
 

@@ -1,0 +1,350 @@
+{
+  "format": "USVocAssigner-session",
+  "version": 1,
+  "audio": [
+    {
+      "path": "C:\\Users\\leaf0\\OneDrive\\바탕 화면\\2026 여름 NEE 랩인턴\\2026-10-12 mini mic\\wav1\\avisoftmini__2026-10-12_15-19-52_001.wav",
+      "sr": 300000,
+      "csv_spec": null,
+      "subject_id": "avisoft_base",
+      "gain_db": 0.0,
+      "response_csv": null
+    },
+    {
+      "path": "C:\\Users\\leaf0\\OneDrive\\바탕 화면\\2026 여름 NEE 랩인턴\\2026-10-12 mini mic\\wav1\\nonemini__2026-10-12_15-19-52_001.wav",
+      "sr": 300000,
+      "csv_spec": null,
+      "subject_id": "none",
+      "gain_db": 0.0,
+      "response_csv": null
+    },
+    {
+      "path": "C:\\Users\\leaf0\\OneDrive\\바탕 화면\\2026 여름 NEE 랩인턴\\2026-10-12 mini mic\\wav1\\redmini__2026-10-12_15-19-52_001.wav",
+      "sr": 300000,
+      "csv_spec": null,
+      "subject_id": "red",
+      "gain_db": 0.0,
+      "response_csv": null
+    }
+  ],
+  "video": "C:/Users/leaf0/OneDrive/바탕 화면/2026 여름 NEE 랩인턴/2026-10-12 mini mic/WIN_20261012_15_19_10_Pro.mp4",
+  "label": "C:/Users/leaf0/OneDrive/바탕 화면/2026 여름 NEE 랩인턴/2026-10-12 mini mic/wav1/avisoftmini__2026-10-12_15-19-52_001.csv",
+  "labels": [
+    {
+      "path": "C:/Users/leaf0/OneDrive/바탕 화면/2026 여름 NEE 랩인턴/2026-10-12 mini mic/wav1/avisoftmini__2026-10-12_15-19-52_001.csv",
+      "spec": {
+        "encoding": "utf-8-sig",
+        "delimiter": ",",
+        "header_row": 0,
+        "onset_col": 1,
+        "offset_col": 2,
+        "fmin_col": null,
+        "fmax_col": null,
+        "time_unit": "s",
+        "frequency_unit": "Hz",
+        "label_hop_length": 38
+      }
+    },
+    {
+      "path": "C:/Users/leaf0/OneDrive/바탕 화면/2026 여름 NEE 랩인턴/2026-10-12 mini mic/wav1/nonemini__2026-10-12_15-19-52_001.csv",
+      "spec": {
+        "encoding": "utf-8-sig",
+        "delimiter": ",",
+        "header_row": 0,
+        "onset_col": 1,
+        "offset_col": 2,
+        "fmin_col": null,
+        "fmax_col": null,
+        "time_unit": "s",
+        "frequency_unit": "Hz",
+        "label_hop_length": 38
+      }
+    },
+    {
+      "path": "C:/Users/leaf0/OneDrive/바탕 화면/2026 여름 NEE 랩인턴/2026-10-12 mini mic/wav1/redmini__2026-10-12_15-19-52_001.csv",
+      "spec": {
+        "encoding": "utf-8-sig",
+        "delimiter": ",",
+        "header_row": 0,
+        "onset_col": 1,
+        "offset_col": 2,
+        "fmin_col": null,
+        "fmax_col": null,
+        "time_unit": "s",
+        "frequency_unit": "Hz",
+        "label_hop_length": 38
+      }
+    }
+  ],
+  "tracking": null,
+  "tracking_csv_spec": null,
+  "geometry": null,
+  "training_path": null,
+  "manual_ratio_threshold_log": 0.003,
+  "empirical_threshold": {
+    "r_mid": 0.0,
+    "mad": 0.0,
+    "k": 1.0,
+    "manual_margin": 0.003
+  },
+  "anchor_mapping": null,
+  "audio_start_s": 0.0,
+  "video_start_s": 21.34,
+  "video_fps": 29.84033193637096,
+  "n_fft": 512,
+  "hop_length": 38,
+  "calibration_gain_enabled": 0,
+  "calibration_response_enabled": 0,
+  "calibration_reference_ch": 0,
+  "calibration_interval_s": [
+    0.0,
+    1.0
+  ],
+  "calibration_band_khz": [
+    35.0,
+    100.0
+  ],
+  "spec_time_span_ms": 10000,
+  "spec_fmin_khz": 0.0,
+  "spec_fmax_khz": 150.0,
+  "spec_window_ms": 4.096,
+  "view_start_ms": 39387,
+  "color_levels_db": [
+    -110.0,
+    -35.0
+  ],
+  "results": {
+    "ratio": [
+      {
+        "event": {
+          "onset_s": 32.3732,
+          "offset_s": 32.387,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch3",
+        "margin_db": 4.540157318115234,
+        "levels_db": {
+          "ch1": -65.21720123291016,
+          "ch2": -60.60661697387695,
+          "ch3": -56.06645965576172
+        },
+        "reason": "assigned ch3: level gap=4.54 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 35.7349,
+          "offset_s": 35.7791,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": null,
+        "margin_db": 0.8365592956542969,
+        "levels_db": {
+          "ch1": -64.90141296386719,
+          "ch2": -59.769893646240234,
+          "ch3": -58.93333435058594
+        },
+        "reason": "unassigned: level gap=0.84 dB < minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 63.5331,
+          "offset_s": 63.6075,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 21.04015350341797,
+        "levels_db": {
+          "ch1": -64.59393310546875,
+          "ch2": -37.86882781982422,
+          "ch3": -58.90898132324219
+        },
+        "reason": "assigned ch2: level gap=21.04 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 63.8242,
+          "offset_s": 63.8917,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 22.025047302246094,
+        "levels_db": {
+          "ch1": -63.86740493774414,
+          "ch2": -37.09052658081055,
+          "ch3": -59.11557388305664
+        },
+        "reason": "assigned ch2: level gap=22.03 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 64.0831,
+          "offset_s": 64.1566,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 20.797821044921875,
+        "levels_db": {
+          "ch1": -65.00096893310547,
+          "ch2": -38.54128646850586,
+          "ch3": -59.339107513427734
+        },
+        "reason": "assigned ch2: level gap=20.80 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 64.3397,
+          "offset_s": 64.4165,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 18.75936508178711,
+        "levels_db": {
+          "ch1": -64.63158416748047,
+          "ch2": -41.48531723022461,
+          "ch3": -60.24468231201172
+        },
+        "reason": "assigned ch2: level gap=18.76 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 64.6157,
+          "offset_s": 64.6847,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 4.595283508300781,
+        "levels_db": {
+          "ch1": -65.00249481201172,
+          "ch2": -58.536781311035156,
+          "ch3": -63.13206481933594
+        },
+        "reason": "assigned ch2: level gap=4.60 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 64.9361,
+          "offset_s": 65.0051,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 4.3652496337890625,
+        "levels_db": {
+          "ch1": -65.31260681152344,
+          "ch2": -58.06953811645508,
+          "ch3": -62.43478775024414
+        },
+        "reason": "assigned ch2: level gap=4.37 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 65.2447,
+          "offset_s": 65.2837,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 4.304973602294922,
+        "levels_db": {
+          "ch1": -64.69309997558594,
+          "ch2": -58.964847564697266,
+          "ch3": -63.26982116699219
+        },
+        "reason": "assigned ch2: level gap=4.30 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 65.5138,
+          "offset_s": 65.5537,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 4.476436614990234,
+        "levels_db": {
+          "ch1": -65.17810821533203,
+          "ch2": -58.08719253540039,
+          "ch3": -62.563629150390625
+        },
+        "reason": "assigned ch2: level gap=4.48 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 65.7713,
+          "offset_s": 65.7959,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 3.1084747314453125,
+        "levels_db": {
+          "ch1": -64.8951187133789,
+          "ch2": -59.790428161621094,
+          "ch3": -62.898902893066406
+        },
+        "reason": "assigned ch2: level gap=3.11 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      },
+      {
+        "event": {
+          "onset_s": 66.0178,
+          "offset_s": 66.0502,
+          "fmin_hz": null,
+          "fmax_hz": null
+        },
+        "channel_id": "ch2",
+        "margin_db": 3.3598709106445312,
+        "levels_db": {
+          "ch1": -65.3179931640625,
+          "ch2": -59.803062438964844,
+          "ch3": -63.162933349609375
+        },
+        "reason": "assigned ch2: level gap=3.36 dB >= minimum 3.00 dB",
+        "mouse_id": null,
+        "method": "ratio-only",
+        "candidate_errors_db": {}
+      }
+    ],
+    "distance": [],
+    "geometry": []
+  }
+}

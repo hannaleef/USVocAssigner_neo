@@ -24,6 +24,57 @@ def smoke_test():
     assert rows[0].channel_id == "A", rows
     return rows
 
+
+def calibration_smoke_test():
+    """No GUI required: verify gain/response alter the feature, not raw WAV."""
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    from audio.aud_process import (
+        calibration_band_level_db, load_frequency_response_csv,
+        event_level, window_spectrogram
+    )
+
+    sr = 250_000
+    t = np.arange(int(sr*.20), dtype=np.float64) / sr
+    tone = np.sin(2*np.pi*50_000*t).astype(np.float32)
+    ref = AudioData("ch1", None, sr, 0.20*tone)
+    mic = AudioData("ch2", None, sr, 0.10*tone)
+    before = event_level(mic, USVEvent(.020,.180, 45_000,55_000))
+    original_samples = mic.samples.copy()
+    ref_level = calibration_band_level_db(ref,.01,.19,40_000,60_000)
+    mic_level = calibration_band_level_db(mic,.01,.19,40_000,60_000)
+    mic.gain_db = ref_level-mic_level
+    mic.apply_gain = True
+    after_gain = event_level(mic, USVEvent(.020,.180,45_000,55_000))
+    ref_event = event_level(ref, USVEvent(.020,.180,45_000,55_000))
+    assert abs(mic.gain_db-6.0206) < .1, mic.gain_db
+    assert abs(after_gain-ref_event) < .25, (after_gain,ref_event)
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory)/"response.csv"
+        path.write_text(
+            "frequency_hz,response_db\n"
+            "40000,-6\n50000,-6\n60000,-6\n",
+            encoding="utf-8"
+        )
+        f, d = load_frequency_response_csv(path)
+        mic.apply_gain = False
+        mic.response_freq_hz, mic.response_db = f,d
+        mic.apply_response = True
+        after_response = event_level(
+            mic, USVEvent(.020,.180,45_000,55_000)
+        )
+        assert abs((after_response-before)-6.0) < .3, (
+            after_response,before
+        )
+    assert np.array_equal(mic.samples, original_samples)
+    return {
+        "relative_gain_db": float(ref_level-mic_level),
+        "response_delta_db": float(after_response-before),
+        "raw_wav_unchanged": True
+    }
+
+
 def realtime_media_playback_regression_test():
     """250kS/s source 2s must yield 48kHz preview 2s, NOT 10.42s.
 
@@ -244,10 +295,23 @@ def geometry_formula_smoke_test():
     # Complement mode must NOT affect the independently defined distance-only weight.
     dc = empirical_distance_weights(A, B, cfg_complement)
     assert np.isclose(dc["omega_geo"], dc["omega_d"])
+    # Legacy fitted decision still works for earlier scripts.
     th = EmpiricalThreshold(r_mid=0., mad=0.5, k=1.)
     assert empirical_decision(0.6, th, "A", "B") == "A"
     assert empirical_decision(-0.6, th, "A", "B") == "B"
     assert empirical_decision(0., th, "A", "B") is None
+
+    # No training data needed: manual zero-centered log-amplitude ratio.
+    from .ratio_corr import manual_empirical_threshold
+    for margin in (0.03, 0.5, 1.0):
+        manual = manual_empirical_threshold(margin)
+        assert manual.r_mid == 0.0
+        assert np.isclose(manual.half_width, margin)
+        assert empirical_decision(+margin, manual, "A", "B") is None
+        assert empirical_decision(-margin, manual, "A", "B") is None
+        assert empirical_decision(margin + .001, manual, "A", "B") == "A"
+        assert empirical_decision(-margin - .001, manual, "A", "B") == "B"
+    assert empirical_decision(0, manual_empirical_threshold(0), "A", "B") is None
     return w
 
 

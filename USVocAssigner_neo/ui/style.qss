@@ -146,12 +146,14 @@ QGroupBox::title {
     background-color: #252525;
 }
 
-/* Default Analyzing: data / STFT / Sync / display / geometry / validation.
-   Actual widgets stay functional; only their visual grouping changes. */
+/* Default: labels/STFT/Sync/display. Test: SLEAP, geometry, model checks.
+   Original controls stay functional; only their location changes. */
 QGroupBox#settings_group_files,
 QGroupBox#settings_group_stft,
 QGroupBox#settings_group_sync,
 QGroupBox#settings_group_display,
+QGroupBox#settings_group_audio_calibration,
+QGroupBox#settings_group_video_tracking,
 QGroupBox#settings_group_geometry,
 QGroupBox#settings_group_validation {
     background-color: #262626;
@@ -166,6 +168,8 @@ QGroupBox#settings_group_files::title,
 QGroupBox#settings_group_stft::title,
 QGroupBox#settings_group_sync::title,
 QGroupBox#settings_group_display::title,
+QGroupBox#settings_group_audio_calibration::title,
+QGroupBox#settings_group_video_tracking::title,
 QGroupBox#settings_group_geometry::title,
 QGroupBox#settings_group_validation::title {
     subcontrol-origin: margin;
